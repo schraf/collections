@@ -92,15 +92,15 @@ func NewFixedBlockMap[V any](capacity uint64) *FixedBlockMap[V] {
 	}
 }
 
-func (m *FixedBlockMap[V]) Iter() iter.Seq[*V] {
-	return func(yield func(*V) bool) {
+func (m *FixedBlockMap[V]) Iter() iter.Seq2[FixedBlockKey, *V] {
+	return func(yield func(FixedBlockKey, *V) bool) {
 		for blockIndex := range m.blocks {
 			block := &m.blocks[blockIndex]
 
 			for i := 0; i < FixedBlockSize; i++ {
 				// Skip empty and deleted slots
 				if block.control[i] != 0x0 && block.control[i] != 0x1 {
-					if !yield(&block.values[i]) {
+					if !yield(block.keys[i], &block.values[i]) {
 						return
 					}
 				}
