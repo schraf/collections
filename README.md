@@ -104,7 +104,7 @@ func main() {
     }
     
     // Iterate over all values
-    for value := range m.Iter() {
+    for _, value := range m.Iter() {
         fmt.Printf("User ID: %d, Score: %d\n", value.ID, value.Score)
     }
     
@@ -157,9 +157,9 @@ Removes a key from the map. The operation is idempotent - deleting a non-existen
 Returns an iterator over all values in the map. Uses Go's range-over-func iterator pattern. Deleted entries are automatically skipped. The iteration order is not guaranteed.
 
 ```go
-for value := range m.Iter() {
+for key, value := range m.Iter() {
     // Process each value
-    fmt.Printf("Value: %v\n", *value)
+    fmt.Printf("Key: %v, Value: %v\n", key, *value)
 }
 ```
 
