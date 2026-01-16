@@ -16,6 +16,8 @@ This package contains optimized collection implementations designed for specific
 - **SIMD-friendly operations**: Uses bitwise operations for parallel tag matching within blocks
 - **Open addressing with linear probing**: Handles collisions by probing to the next block
 - **Tombstone-based deletion**: Deleted entries are marked for efficient reinsertion
+- **Iteration support**: Iterate over all values using Go's range-over-func iterator
+- **In-place rehashing**: Efficiently remove tombstones and optimize entry placement without memory overhead
 - **Serialization support**: Can write/read the entire map structure directly to/from memory
 - **Type-safe with generics**: Works with any value type using Go generics
 
@@ -98,6 +100,17 @@ func main() {
     if !found {
         fmt.Println("Key not found")
     }
+    
+    // Iterate over all values
+    for value := range m.Iter() {
+        fmt.Printf("User ID: %d, Score: %d\n", value.ID, value.Score)
+    }
+    
+    // After many deletions, rehash to optimize performance
+    err = m.Rehash()
+    if err != nil {
+        panic(err)
+    }
 }
 ```
 
@@ -122,6 +135,31 @@ Inserts or updates a key-value pair. Returns an error if the map is full (all bl
 #### `Delete(key FixedBlockKey)`
 
 Removes a key from the map. The operation is idempotent - deleting a non-existent key is safe.
+
+#### `Iter() iter.Seq[*V]`
+
+Returns an iterator over all values in the map. Uses Go's range-over-func iterator pattern. Deleted entries are automatically skipped. The iteration order is not guaranteed.
+
+```go
+for value := range m.Iter() {
+    // Process each value
+    fmt.Printf("Value: %v\n", *value)
+}
+```
+
+#### `Rehash() error`
+
+Removes all deleted slots (tombstones) and rehashes all entries to their optimal positions. This improves lookup performance by eliminating tombstone interference and reducing probe chain lengths. The operation is performed in-place without allocating additional memory, making it efficient even for maps with millions of entries.
+
+**When to use**: Call `Rehash()` periodically after performing many deletions, especially if lookup performance has degraded. The function is safe to call at any time and will not affect existing entries.
+
+```go
+// After many deletions
+err := m.Rehash()
+if err != nil {
+    // Handle error (should be rare, only if map is full during re-insertion)
+}
+```
 
 #### `WriteTo(w io.Writer) (int64, error)`
 
