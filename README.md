@@ -16,6 +16,10 @@ This package contains optimized collection implementations designed for specific
 - **SIMD-friendly operations**: Uses bitwise operations for parallel tag matching within blocks
 - **Open addressing with linear probing**: Handles collisions by probing to the next block
 - **Tombstone-based deletion**: Deleted entries are marked for efficient reinsertion
+- **Iteration support**: Iterate over all values using Go's range-over-func iterator
+- **In-place rehashing**: Efficiently remove tombstones and optimize entry placement using a linked list for deferred entries
+- **Dynamic growth**: Extend map capacity in-place and automatically rehash entries to optimal positions
+- **Health monitoring**: Collect statistics and get recommendations for when to rehash or grow
 - **Serialization support**: Can write/read the entire map structure directly to/from memory
 - **Type-safe with generics**: Works with any value type using Go generics
 
@@ -98,6 +102,31 @@ func main() {
     if !found {
         fmt.Println("Key not found")
     }
+    
+    // Iterate over all values
+    for value := range m.Iter() {
+        fmt.Printf("User ID: %d, Score: %d\n", value.ID, value.Score)
+    }
+    
+    // Check map health and get recommendations
+    info := m.CollectInfo()
+    fmt.Printf("Load Factor: %.2f, Tombstone Factor: %.2f\n", info.LoadFactor, info.TombstoneFactor)
+    
+    // After many deletions, rehash to optimize performance
+    if info.RecommendRehash {
+        err = m.Rehash()
+        if err != nil {
+            panic(err)
+        }
+    }
+    
+    // Grow the map if it's getting full
+    if info.RecommendGrow {
+        err = m.Grow(m.Capacity() * 2)
+        if err != nil {
+            panic(err)
+        }
+    }
 }
 ```
 
@@ -123,6 +152,80 @@ Inserts or updates a key-value pair. Returns an error if the map is full (all bl
 
 Removes a key from the map. The operation is idempotent - deleting a non-existent key is safe.
 
+#### `Iter() iter.Seq[*V]`
+
+Returns an iterator over all values in the map. Uses Go's range-over-func iterator pattern. Deleted entries are automatically skipped. The iteration order is not guaranteed.
+
+```go
+for value := range m.Iter() {
+    // Process each value
+    fmt.Printf("Value: %v\n", *value)
+}
+```
+
+#### `Rehash() error`
+
+Removes all deleted slots (tombstones) and rehashes all entries to their optimal positions. This improves lookup performance by eliminating tombstone interference and reducing probe chain lengths. The operation uses an efficient in-place algorithm that:
+
+- Converts all deleted slots to empty slots
+- Moves entries to their optimal blocks when space is available
+- Periodically attempts to reinsert deferred entries as slots become available
+- Uses a linked list to track entries that need reinsertion, avoiding memory overhead
+
+**When to use**: Call `Rehash()` periodically after performing many deletions, especially if lookup performance has degraded. You can use `CollectInfo()` to check if rehashing is recommended. The function is safe to call at any time and will not affect existing entries.
+
+```go
+// After many deletions
+err := m.Rehash()
+if err != nil {
+    // Handle error (should be rare, only if map is full during re-insertion)
+}
+```
+
+#### `Grow(newCapacity uint64) error`
+
+Increases the map capacity to the specified value. If the new capacity requires no additional blocks, the function returns early. The map never shrinks. The operation:
+
+- Extends the existing blocks slice in-place (no separate allocation)
+- Automatically calls `Rehash()` to rehash all entries to their optimal positions with the new mask
+- Removes all tombstones in the process
+- Efficiently handles maps with millions of entries
+
+**When to use**: Call `Grow()` when you need more capacity. Use `CollectInfo()` to check if growing is recommended (when load factor is high). The function is safe to call at any time.
+
+```go
+// Grow to double the current capacity
+err := m.Grow(m.Capacity() * 2)
+if err != nil {
+    // Handle error (should be rare, only if map is full during re-insertion)
+}
+```
+
+#### `CollectInfo() FixedBlockMapInfo`
+
+Collects statistics about the map and provides recommendations for optimization. Returns a `FixedBlockMapInfo` struct containing:
+
+- **LoadFactor**: Ratio of stored entities to total capacity (0.0 to 1.0)
+- **TombstoneFactor**: Ratio of deleted slots (tombstones) to total capacity (0.0 to 1.0)
+- **RecommendRehash**: `true` when tombstone factor is >= 0.20, indicating rehashing would be beneficial
+- **RecommendGrow**: `true` when load factor is >= 0.75, indicating the map is getting full
+
+**When to use**: Call `CollectInfo()` periodically to monitor map health and decide when to call `Rehash()` or `Grow()`.
+
+```go
+info := m.CollectInfo()
+fmt.Printf("Load: %.2f%%, Tombstones: %.2f%%\n", 
+    info.LoadFactor*100, info.TombstoneFactor*100)
+
+if info.RecommendRehash {
+    m.Rehash()
+}
+
+if info.RecommendGrow {
+    m.Grow(m.Capacity() * 2)
+}
+```
+
 #### `WriteTo(w io.Writer) (int64, error)`
 
 Writes the entire map structure to an `io.Writer`. This performs a raw memory dump, so the map can be efficiently serialized. **Warning**: Only use with value types that contain no pointers, slices, maps, or other reference types. Types with indirection (like `string`, `[]byte`, or structs with pointer fields) will not serialize correctly.
@@ -140,7 +243,7 @@ Reads a map structure from an `io.Reader`. The map must be initialized with the 
 
 ### Limitations
 
-- Capacity must be specified at creation time
+- Initial capacity must be specified at creation time (can be extended later with `Grow()`)
 - Map overflow error occurs when all blocks are full
 - Keys must be created using `FromString` or manually constructed as 16-byte arrays
 - Serialization requires the map to be initialized with matching capacity
@@ -155,7 +258,7 @@ Reads a map structure from an `io.Reader`. The map must be initialized with the 
 - Use cases where you can pre-allocate based on expected size
 
 Consider the standard Go `map` for:
-- Dynamic resizing requirements
+- Automatic dynamic resizing (FixedBlockMap requires manual `Grow()` calls)
 - String keys without conversion
 - Simpler API needs
 
