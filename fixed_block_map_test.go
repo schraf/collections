@@ -309,7 +309,7 @@ func TestFixedBlockMap_Iter(t *testing.T) {
 
 	// Collect all values from iterator
 	var iteratedValues []testValue
-	for v := range m.Iter() {
+	for _, v := range m.Iter() {
 		iteratedValues = append(iteratedValues, *v)
 	}
 
@@ -332,7 +332,7 @@ func TestFixedBlockMap_Iter(t *testing.T) {
 
 	// Iterate again
 	iteratedValues = nil
-	for v := range m.Iter() {
+	for _, v := range m.Iter() {
 		iteratedValues = append(iteratedValues, *v)
 	}
 
@@ -417,7 +417,7 @@ func TestFixedBlockMap_Rehash(t *testing.T) {
 
 	// Verify iteration still works correctly after rehash
 	var iteratedValues []testValue
-	for v := range m.Iter() {
+	for _, v := range m.Iter() {
 		iteratedValues = append(iteratedValues, *v)
 	}
 	// Should have 16 values (20 - 4 deleted)
@@ -484,7 +484,7 @@ func TestFixedBlockMap_Grow(t *testing.T) {
 
 	// Verify iteration works
 	var iteratedValues []testValue
-	for v := range m.Iter() {
+	for _, v := range m.Iter() {
 		iteratedValues = append(iteratedValues, *v)
 	}
 	// Should have 4 values (5 - 1 deleted)
