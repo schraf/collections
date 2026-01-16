@@ -1,10 +1,12 @@
 package main
 
 import (
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"math/bits"
 	"reflect"
 	"unsafe"
@@ -37,6 +39,22 @@ func (k *FixedBlockKey) FromString(text string) {
 	binary.LittleEndian.PutUint64(k[8:16], h2)
 }
 
+type FixedBlockMapInfo struct {
+	// ratio of stored entities to capacity
+	LoadFactor float32
+
+	// ratio of tombstones to total slots
+	TombstoneFactor float32
+
+	// set to true when TombstoreFactor value indicates that it would
+	// be beneficial to rehash the map
+	RecommendRehash bool
+
+	// set to true when LoadFactor value indicates that it would
+	// be beneficial to grow the map
+	RecommendGrow bool
+}
+
 type FixedBlock[V any] struct {
 	control [FixedBlockSize]uint8
 	keys    [FixedBlockSize]FixedBlockKey
@@ -48,8 +66,9 @@ type FixedBlockMap[V any] struct {
 	mask   uint64
 }
 
-// NewFixedBlockMap initializes the map to support the given capacity
-func NewFixedBlockMap[V any](capacity uint64) *FixedBlockMap[V] {
+// calculateBlockCount calculates the number of blocks needed for a given capacity.
+// Returns the next power of two that can accommodate the capacity.
+func calculateBlockCount(capacity uint64) uint64 {
 	// Calculate how many blocks we need using ceiling division
 	blockCount := (capacity + FixedBlockSize - 1) / FixedBlockSize
 
@@ -60,10 +79,41 @@ func NewFixedBlockMap[V any](capacity uint64) *FixedBlockMap[V] {
 		blockCount = 1 << (64 - bits.LeadingZeros64(blockCount-1))
 	}
 
+	return blockCount
+}
+
+// NewFixedBlockMap initializes the map to support the given capacity
+func NewFixedBlockMap[V any](capacity uint64) *FixedBlockMap[V] {
+	blockCount := calculateBlockCount(capacity)
+
 	return &FixedBlockMap[V]{
 		blocks: make([]FixedBlock[V], blockCount),
 		mask:   blockCount - 1,
 	}
+}
+
+func (m *FixedBlockMap[V]) Iter() iter.Seq[*V] {
+	return func(yield func(*V) bool) {
+		for blockIndex := range m.blocks {
+			block := &m.blocks[blockIndex]
+
+			for i := 0; i < FixedBlockSize; i++ {
+				// Skip empty and deleted slots
+				if block.control[i] != 0x0 && block.control[i] != 0x1 {
+					if !yield(&block.values[i]) {
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+// Capacity returns the maximum capacity of the map
+func (m *FixedBlockMap[V]) Capacity() uint64 {
+	var capacity uint64
+	capacity = uint64(len(m.blocks)) * FixedBlockSize
+	return capacity
 }
 
 // hashToBlock takes the 16-byte key (already a hash) and returns the starting block index.
@@ -97,7 +147,7 @@ func (m *FixedBlockMap[V]) Get(key FixedBlockKey) (*V, bool) {
 
 		// Check for an 'Empty' slot in this block to terminate search early
 		// Logic: if any byte in control is 0x00, the search ends.
-		if (control-0x0101010101010101) & ^control & 0x8080808080808080 != 0 {
+		if (control-0x0101010101010101) & ^control & 0x8080808080808080 != 0x0 {
 			return nil, false
 		}
 
@@ -135,7 +185,7 @@ func (m *FixedBlockMap[V]) Put(key FixedBlockKey, value V) error {
 
 		// Look for an empty or deleted slot to insert
 		for i := 0; i < 8; i++ {
-			if block.control[i] == 0 {
+			if block.control[i] == 0x0 {
 				// If we found a tombstone earlier, use that instead to keep the chain short
 				if firstDeletedBlock != nil {
 					firstDeletedBlock.control[firstDeletedIndex] = tag
@@ -151,7 +201,7 @@ func (m *FixedBlockMap[V]) Put(key FixedBlockKey, value V) error {
 
 				return nil
 			}
-			if block.control[i] == 0x01 && firstDeletedBlock == nil {
+			if block.control[i] == 0x1 && firstDeletedBlock == nil {
 				firstDeletedBlock = block
 				firstDeletedIndex = i
 			}
@@ -191,12 +241,201 @@ func (m *FixedBlockMap[V]) Delete(key FixedBlockKey) {
 		}
 
 		// If we hit an empty slot, the key isn't in the map
-		if (control-0x0101010101010101) & ^control & 0x8080808080808080 != 0 {
+		if (control-0x0101010101010101) & ^control & 0x8080808080808080 != 0x0 {
 			return
 		}
 
 		blockIndex = (blockIndex + 1) & m.mask
 	}
+}
+
+func (m *FixedBlockMap[V]) CollectInfo() FixedBlockMapInfo {
+	var storedEntities uint64
+	var tombstones uint64
+	totalSlots := m.Capacity()
+
+	// Count stored entities and tombstones
+	for blockIndex := range m.blocks {
+		block := &m.blocks[blockIndex]
+		for i := 0; i < FixedBlockSize; i++ {
+			if block.control[i] == 0x1 {
+				// Tombstone (deleted slot)
+				tombstones++
+			} else if block.control[i] != 0x0 {
+				// Stored entity (non-empty, non-deleted)
+				storedEntities++
+			}
+		}
+	}
+
+	// Calculate factors
+	var loadFactor float32
+	var tombstoneFactor float32
+
+	if totalSlots > 0 {
+		loadFactor = float32(storedEntities) / float32(totalSlots)
+		tombstoneFactor = float32(tombstones) / float32(totalSlots)
+	}
+
+	return FixedBlockMapInfo{
+		LoadFactor:      loadFactor,
+		TombstoneFactor: tombstoneFactor,
+		RecommendGrow:   loadFactor >= 0.75,
+		RecommendRehash: tombstoneFactor >= 0.20,
+	}
+}
+
+// Rehash removes all deleted slots and rehashes all entries to optimize lookup performance.
+// This function performs in-place rehashing without allocating additional memory for
+// collecting entries, making it efficient for maps with millions of entries.
+func (m *FixedBlockMap[V]) Rehash() error {
+	//--==============================================================================--
+	//--== Convert all deleted slots (0x1) to empty slots (0x0)
+	//--==============================================================================--
+	for blockIndex := range m.blocks {
+		block := &m.blocks[blockIndex]
+		for i := 0; i < FixedBlockSize; i++ {
+			if block.control[i] == 0x1 {
+				block.control[i] = 0x0
+			}
+		}
+	}
+
+	//--==============================================================================--
+	//--== Attempt to reposition entries not in their optimal blocks
+	//--==============================================================================--
+
+	type entry struct {
+		key   FixedBlockKey
+		value V
+	}
+
+	reinsertList := list.New()
+	rehashedSinceLastReinsertAttempt := 0
+
+	for blockIndex := range m.blocks {
+		block := &m.blocks[blockIndex]
+
+	BlockScanLoop:
+		for i := 0; i < FixedBlockSize; i++ {
+			// Skip empty slots
+			if block.control[i] == 0x0 {
+				continue
+			}
+
+			key := block.keys[i]
+			value := block.values[i]
+			optimalBlockIndex := m.hashToBlock(key)
+			currentBlockIndex := uint64(blockIndex)
+
+			// Check if this entry is in its optimal position
+			if optimalBlockIndex == currentBlockIndex {
+				continue
+			}
+
+			// Check if optimal block has empty slots
+			optimalBlock := &m.blocks[optimalBlockIndex]
+
+			for j := 0; j < FixedBlockSize; j++ {
+				if optimalBlock.control[j] == 0x0 {
+					tag := key[0] | 0x80
+
+					// place the entry into the optimal block
+					optimalBlock.control[j] = tag
+					optimalBlock.keys[j] = key
+					optimalBlock.values[j] = value
+
+					// clear the current slot
+					block.control[i] = 0x0
+
+					// mark that we have successfully rehashed an entry
+					rehashedSinceLastReinsertAttempt++
+
+					continue BlockScanLoop
+				}
+			}
+
+			// add this entry to be reinserted later
+			reinsertList.PushBack(entry{
+				key:   key,
+				value: value,
+			})
+
+			// clear the slot in this block
+			block.control[i] = 0x0
+		}
+
+		// Iterate through the reinsert list and try to place entries that can
+		// now go into their optimal blocks (which may now have empty slots)
+		if rehashedSinceLastReinsertAttempt > reinsertList.Len() {
+			for e := reinsertList.Front(); e != nil; {
+				next := e.Next() // Save next before potentially removing current
+				entry := e.Value.(entry)
+				optimalBlockIndex := m.hashToBlock(entry.key)
+				optimalBlock := &m.blocks[optimalBlockIndex]
+
+				// Check if optimal block now has empty slots
+				for j := 0; j < FixedBlockSize; j++ {
+					if optimalBlock.control[j] == 0x0 {
+						tag := entry.key[0] | 0x80
+
+						// Place the entry into the optimal block
+						optimalBlock.control[j] = tag
+						optimalBlock.keys[j] = entry.key
+						optimalBlock.values[j] = entry.value
+
+						// Remove from list since it's been successfully reinserted
+						reinsertList.Remove(e)
+						break
+					}
+				}
+
+				e = next // Move to next element
+			}
+
+			rehashedSinceLastReinsertAttempt = 0
+		}
+	}
+
+	//--==============================================================================--
+	//--== Insert any remaining entries that need to be reinserted
+	//--==============================================================================--
+
+	for reinsertList.Len() != 0 {
+		entry := reinsertList.Remove(reinsertList.Front()).(entry)
+
+		if err := m.Put(entry.key, entry.value); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Grow increases the map capacity to the specified value. If the new capacity
+// requires no additional blocks, the function returns early. The map never shrinks.
+// All entries are rehashed to their optimal positions in the new structure,
+// and all deleted slots (tombstones) are removed in the process.
+// This operation extends the existing blocks slice in-place and then rehashes.
+// Entries that need to be moved are collected first, then re-inserted, to avoid
+// issues with entries being moved during iteration.
+func (m *FixedBlockMap[V]) Grow(newCapacity uint64) error {
+	newBlockCount := calculateBlockCount(newCapacity)
+	currentBlockCount := uint64(len(m.blocks))
+
+	// Early return if no growth needed (never shrink)
+	if newBlockCount <= currentBlockCount {
+		return nil
+	}
+
+	// Calculate how many new blocks to add
+	blocksToAdd := int(newBlockCount - currentBlockCount)
+
+	// Extend the existing blocks slice by appending new empty blocks
+	m.blocks = append(m.blocks, make([]FixedBlock[V], blocksToAdd)...)
+	m.mask = newBlockCount - 1
+
+	return m.Rehash()
 }
 
 // WriteTo writes the entire raw memory block of the map to an io.Writer.
