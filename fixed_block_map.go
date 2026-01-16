@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -49,8 +50,9 @@ type FixedBlockMap[V any] struct {
 	mask   uint64
 }
 
-// NewFixedBlockMap initializes the map to support the given capacity
-func NewFixedBlockMap[V any](capacity uint64) *FixedBlockMap[V] {
+// calculateBlockCount calculates the number of blocks needed for a given capacity.
+// Returns the next power of two that can accommodate the capacity.
+func calculateBlockCount(capacity uint64) uint64 {
 	// Calculate how many blocks we need using ceiling division
 	blockCount := (capacity + FixedBlockSize - 1) / FixedBlockSize
 
@@ -60,6 +62,13 @@ func NewFixedBlockMap[V any](capacity uint64) *FixedBlockMap[V] {
 	} else {
 		blockCount = 1 << (64 - bits.LeadingZeros64(blockCount-1))
 	}
+
+	return blockCount
+}
+
+// NewFixedBlockMap initializes the map to support the given capacity
+func NewFixedBlockMap[V any](capacity uint64) *FixedBlockMap[V] {
+	blockCount := calculateBlockCount(capacity)
 
 	return &FixedBlockMap[V]{
 		blocks: make([]FixedBlock[V], blockCount),
@@ -228,7 +237,9 @@ func (m *FixedBlockMap[V]) Delete(key FixedBlockKey) {
 // This function performs in-place rehashing without allocating additional memory for
 // collecting entries, making it efficient for maps with millions of entries.
 func (m *FixedBlockMap[V]) Rehash() error {
-	// First pass: Convert all deleted slots (0x1) to empty slots (0x0)
+	//--==============================================================================--
+	//--== Convert all deleted slots (0x1) to empty slots (0x0)
+	//--==============================================================================--
 	for blockIndex := range m.blocks {
 		block := &m.blocks[blockIndex]
 		for i := 0; i < FixedBlockSize; i++ {
@@ -238,11 +249,22 @@ func (m *FixedBlockMap[V]) Rehash() error {
 		}
 	}
 
-	// Second pass: Re-position entries that are not in their optimal location
-	// We iterate through all blocks and slots, and for each valid entry,
-	// check if it should be moved earlier in its probe chain.
+	//--==============================================================================--
+	//--== Attempt to reposition entries not in their optimal blocks
+	//--==============================================================================--
+
+	type entry struct {
+		key   FixedBlockKey
+		value V
+	}
+
+	reinsertList := list.New()
+	rehashedSinceLastReinsertAttempt := 0
+
 	for blockIndex := range m.blocks {
 		block := &m.blocks[blockIndex]
+
+	BlockScanLoop:
 		for i := 0; i < FixedBlockSize; i++ {
 			// Skip empty slots
 			if block.control[i] == 0x0 {
@@ -255,61 +277,113 @@ func (m *FixedBlockMap[V]) Rehash() error {
 			currentBlockIndex := uint64(blockIndex)
 
 			// Check if this entry is in its optimal position
-			// An entry is optimal if there are no empty slots in the blocks
-			// between its hash block and its current position
-			isOptimal := true
+			if optimalBlockIndex == currentBlockIndex {
+				continue
+			}
 
-			// Scan from optimal block to current block
-			probeBlockIndex := optimalBlockIndex
-			for probeBlockIndex != currentBlockIndex {
-				probeBlock := &m.blocks[probeBlockIndex]
-				// If there's any empty slot in this block, the entry is not optimal
+			// Check if optimal block has empty slots
+			optimalBlock := &m.blocks[optimalBlockIndex]
+
+			for j := 0; j < FixedBlockSize; j++ {
+				if optimalBlock.control[j] == 0x0 {
+					tag := key[0] | 0x80
+
+					// place the entry into the optimal block
+					optimalBlock.control[j] = tag
+					optimalBlock.keys[j] = key
+					optimalBlock.values[j] = value
+
+					// clear the current slot
+					block.control[i] = 0x0
+
+					// mark that we have successfully rehashed an entry
+					rehashedSinceLastReinsertAttempt++
+
+					continue BlockScanLoop
+				}
+			}
+
+			// add this entry to be reinserted later
+			reinsertList.PushBack(entry{
+				key:   key,
+				value: value,
+			})
+
+			// clear the slot in this block
+			block.control[i] = 0x0
+		}
+
+		// Iterate through the reinsert list and try to place entries that can
+		// now go into their optimal blocks (which may now have empty slots)
+		if rehashedSinceLastReinsertAttempt > reinsertList.Len() {
+			for e := reinsertList.Front(); e != nil; {
+				next := e.Next() // Save next before potentially removing current
+				entry := e.Value.(entry)
+				optimalBlockIndex := m.hashToBlock(entry.key)
+				optimalBlock := &m.blocks[optimalBlockIndex]
+
+				// Check if optimal block now has empty slots
 				for j := 0; j < FixedBlockSize; j++ {
-					if probeBlock.control[j] == 0x0 {
-						isOptimal = false
+					if optimalBlock.control[j] == 0x0 {
+						tag := entry.key[0] | 0x80
+
+						// Place the entry into the optimal block
+						optimalBlock.control[j] = tag
+						optimalBlock.keys[j] = entry.key
+						optimalBlock.values[j] = entry.value
+
+						// Remove from list since it's been successfully reinserted
+						reinsertList.Remove(e)
 						break
 					}
 				}
-				if !isOptimal {
-					break
-				}
-				probeBlockIndex = (probeBlockIndex + 1) & m.mask
-				if probeBlockIndex == optimalBlockIndex {
-					// Wrapped around (shouldn't happen), but be safe
-					break
-				}
+
+				e = next // Move to next element
 			}
 
-			// Also check if there's an empty slot before position i in the current block
-			if isOptimal && currentBlockIndex == optimalBlockIndex {
-				for j := 0; j < i; j++ {
-					if block.control[j] == 0x0 {
-						isOptimal = false
-						break
-					}
-				}
-			}
+			rehashedSinceLastReinsertAttempt = 0
+		}
+	}
 
-			if !isOptimal {
-				// Clear the current slot immediately so Put can use it if optimal
-				block.control[i] = 0x0
+	//--==============================================================================--
+	//--== Insert any remaining entries that need to be reinserted
+	//--==============================================================================--
 
-				// Re-insert using Put, which will find the optimal position
-				// (including potentially the slot we just cleared if it's optimal)
-				if err := m.Put(key, value); err != nil {
-					// Restore the entry if Put fails
-					block.control[i] = key[0] | 0x80
-					return fmt.Errorf("rehash failed during re-insertion: %w", err)
-				}
+	for reinsertList.Len() != 0 {
+		entry := reinsertList.Remove(reinsertList.Front()).(entry)
 
-				// Note: If Put placed the entry back in the same slot, that means
-				// it was already optimal and our check had a false negative.
-				// This is harmless, just slightly inefficient.
-			}
+		if err := m.Put(entry.key, entry.value); err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+// Grow increases the map capacity to the specified value. If the new capacity
+// requires no additional blocks, the function returns early. The map never shrinks.
+// All entries are rehashed to their optimal positions in the new structure,
+// and all deleted slots (tombstones) are removed in the process.
+// This operation extends the existing blocks slice in-place and then rehashes.
+// Entries that need to be moved are collected first, then re-inserted, to avoid
+// issues with entries being moved during iteration.
+func (m *FixedBlockMap[V]) Grow(newCapacity uint64) error {
+	newBlockCount := calculateBlockCount(newCapacity)
+	currentBlockCount := uint64(len(m.blocks))
+
+	// Early return if no growth needed (never shrink)
+	if newBlockCount <= currentBlockCount {
+		return nil
+	}
+
+	// Calculate how many new blocks to add
+	blocksToAdd := int(newBlockCount - currentBlockCount)
+
+	// Extend the existing blocks slice by appending new empty blocks
+	m.blocks = append(m.blocks, make([]FixedBlock[V], blocksToAdd)...)
+	m.mask = newBlockCount - 1
+
+	return m.Rehash()
 }
 
 // WriteTo writes the entire raw memory block of the map to an io.Writer.
