@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -37,11 +38,13 @@ func TestNewFixedBlockMap(t *testing.T) {
 	require.NotNil(t, m)
 	assert.NotNil(t, m.blocks)
 	assert.Greater(t, len(m.blocks), 1)
+	assert.GreaterOrEqual(t, m.Capacity(), uint64(10))
 
 	// Test with larger capacity
 	m2 := NewFixedBlockMap[testValue](100)
 	require.NotNil(t, m2)
 	assert.Greater(t, len(m2.blocks), 1)
+	assert.GreaterOrEqual(t, m2.Capacity(), uint64(100))
 }
 
 func TestFixedBlockMap_PutAndGet(t *testing.T) {
@@ -284,4 +287,73 @@ func TestFixedBlockMap_WriteToAndReadFrom(t *testing.T) {
 	val3, found3 := m2.Get(key3)
 	require.True(t, found3)
 	assert.Equal(t, value3, *val3)
+}
+
+func TestFixedBlockMap_Iter(t *testing.T) {
+	m := NewFixedBlockMap[testValue](50)
+
+	// Insert multiple values
+	keys := make([]FixedBlockKey, 10)
+	expectedValues := make([]testValue, 10)
+	for i := 0; i < 10; i++ {
+		keys[i].FromString(fmt.Sprintf("key%d", i))
+		expectedValues[i] = testValue{
+			ID:    uint64(i),
+			Score: int32(i * 10),
+			Flags: uint16(i),
+			Data:  [4]byte{byte(i), byte(i + 1), byte(i + 2), byte(i + 3)},
+		}
+		err := m.Put(keys[i], expectedValues[i])
+		require.NoError(t, err)
+	}
+
+	// Collect all values from iterator
+	var iteratedValues []testValue
+	for v := range m.Iter() {
+		iteratedValues = append(iteratedValues, *v)
+	}
+
+	// Should have found all 10 values
+	assert.Equal(t, 10, len(iteratedValues))
+
+	// Verify all expected values are present (order may vary)
+	found := make(map[testValue]bool)
+	for _, v := range iteratedValues {
+		found[v] = true
+	}
+	for _, expected := range expectedValues {
+		assert.True(t, found[expected], "Expected value %v not found in iteration", expected)
+	}
+
+	// Delete some values and verify they're not in iteration
+	m.Delete(keys[2])
+	m.Delete(keys[5])
+	m.Delete(keys[8])
+
+	// Iterate again
+	iteratedValues = nil
+	for v := range m.Iter() {
+		iteratedValues = append(iteratedValues, *v)
+	}
+
+	// Should have 7 values now (10 - 3 deleted)
+	assert.Equal(t, 7, len(iteratedValues))
+
+	// Verify deleted values are not present
+	for _, v := range iteratedValues {
+		assert.NotEqual(t, expectedValues[2], v)
+		assert.NotEqual(t, expectedValues[5], v)
+		assert.NotEqual(t, expectedValues[8], v)
+	}
+
+	// Verify remaining values are present
+	found = make(map[testValue]bool)
+	for _, v := range iteratedValues {
+		found[v] = true
+	}
+	for i, expected := range expectedValues {
+		if i != 2 && i != 5 && i != 8 {
+			assert.True(t, found[expected], "Expected value %v not found in iteration", expected)
+		}
+	}
 }

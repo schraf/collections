@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"math/bits"
 	"reflect"
 	"unsafe"
@@ -66,6 +67,30 @@ func NewFixedBlockMap[V any](capacity uint64) *FixedBlockMap[V] {
 	}
 }
 
+func (m *FixedBlockMap[V]) Iter() iter.Seq[*V] {
+	return func(yield func(*V) bool) {
+		for blockIndex := range m.blocks {
+			block := &m.blocks[blockIndex]
+
+			for i := 0; i < FixedBlockSize; i++ {
+				// Skip empty and deleted slots
+				if block.control[i] != 0x0 && block.control[i] != 0x01 {
+					if !yield(&block.values[i]) {
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+// Capacity returns the maximum capacity of the map
+func (m *FixedBlockMap[V]) Capacity() uint64 {
+	var capacity uint64
+	capacity = uint64(len(m.blocks)) * FixedBlockSize
+	return capacity
+}
+
 // hashToBlock takes the 16-byte key (already a hash) and returns the starting block index.
 func (m *FixedBlockMap[V]) hashToBlock(key FixedBlockKey) uint64 {
 	// Use the first 8 bytes of the hash-key to pick the block
@@ -97,7 +122,7 @@ func (m *FixedBlockMap[V]) Get(key FixedBlockKey) (*V, bool) {
 
 		// Check for an 'Empty' slot in this block to terminate search early
 		// Logic: if any byte in control is 0x00, the search ends.
-		if (control-0x0101010101010101) & ^control & 0x8080808080808080 != 0 {
+		if (control-0x0101010101010101) & ^control & 0x8080808080808080 != 0x0 {
 			return nil, false
 		}
 
@@ -135,7 +160,7 @@ func (m *FixedBlockMap[V]) Put(key FixedBlockKey, value V) error {
 
 		// Look for an empty or deleted slot to insert
 		for i := 0; i < 8; i++ {
-			if block.control[i] == 0 {
+			if block.control[i] == 0x0 {
 				// If we found a tombstone earlier, use that instead to keep the chain short
 				if firstDeletedBlock != nil {
 					firstDeletedBlock.control[firstDeletedIndex] = tag
@@ -191,7 +216,7 @@ func (m *FixedBlockMap[V]) Delete(key FixedBlockKey) {
 		}
 
 		// If we hit an empty slot, the key isn't in the map
-		if (control-0x0101010101010101) & ^control & 0x8080808080808080 != 0 {
+		if (control-0x0101010101010101) & ^control & 0x8080808080808080 != 0x0 {
 			return
 		}
 
