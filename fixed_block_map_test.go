@@ -1,0 +1,287 @@
+package main
+
+import (
+	"bytes"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// testValue is a struct type used for testing that contains no pointers
+// This is the typical use case for FixedBlockMap since it supports serialization
+type testValue struct {
+	ID    uint64
+	Score int32
+	Flags uint16
+	Data  [4]byte
+}
+
+func TestFixedBlockKey_FromString(t *testing.T) {
+	var key1, key2 FixedBlockKey
+	key1.FromString("hello")
+	key2.FromString("world")
+
+	// Different strings should produce different keys
+	assert.NotEqual(t, key1, key2)
+
+	// Same string should produce same key
+	var key3 FixedBlockKey
+	key3.FromString("hello")
+	assert.Equal(t, key1, key3)
+}
+
+func TestNewFixedBlockMap(t *testing.T) {
+	// Test with small capacity
+	m := NewFixedBlockMap[testValue](10)
+	require.NotNil(t, m)
+	assert.NotNil(t, m.blocks)
+	assert.Greater(t, len(m.blocks), 1)
+
+	// Test with larger capacity
+	m2 := NewFixedBlockMap[testValue](100)
+	require.NotNil(t, m2)
+	assert.Greater(t, len(m2.blocks), 1)
+}
+
+func TestFixedBlockMap_PutAndGet(t *testing.T) {
+	m := NewFixedBlockMap[testValue](10)
+
+	var key1, key2 FixedBlockKey
+	key1.FromString("key1")
+	key2.FromString("key2")
+
+	// Put first key-value pair
+	value1 := testValue{ID: 1, Score: 100, Flags: 0x01, Data: [4]byte{1, 2, 3, 4}}
+	err := m.Put(key1, value1)
+	require.NoError(t, err)
+
+	// Get it back
+	val, found := m.Get(key1)
+	require.True(t, found)
+	require.NotNil(t, val)
+	assert.Equal(t, value1, *val)
+
+	// Put second key-value pair
+	value2 := testValue{ID: 2, Score: 200, Flags: 0x02, Data: [4]byte{5, 6, 7, 8}}
+	err = m.Put(key2, value2)
+	require.NoError(t, err)
+
+	// Get both values
+	val1, found1 := m.Get(key1)
+	require.True(t, found1)
+	assert.Equal(t, value1, *val1)
+
+	val2, found2 := m.Get(key2)
+	require.True(t, found2)
+	assert.Equal(t, value2, *val2)
+
+	// Update existing key
+	updatedValue1 := testValue{ID: 1, Score: 150, Flags: 0x03, Data: [4]byte{9, 10, 11, 12}}
+	err = m.Put(key1, updatedValue1)
+	require.NoError(t, err)
+
+	val1, found1 = m.Get(key1)
+	require.True(t, found1)
+	assert.Equal(t, updatedValue1, *val1)
+
+	// Verify other key unchanged
+	val2, found2 = m.Get(key2)
+	require.True(t, found2)
+	assert.Equal(t, value2, *val2)
+}
+
+func TestFixedBlockMap_GetNonExistent(t *testing.T) {
+	m := NewFixedBlockMap[testValue](10)
+
+	var key1, key2 FixedBlockKey
+	key1.FromString("key1")
+	key2.FromString("key2")
+
+	// Put one key
+	value1 := testValue{ID: 1, Score: 100, Flags: 0x01, Data: [4]byte{1, 2, 3, 4}}
+	err := m.Put(key1, value1)
+	require.NoError(t, err)
+
+	// Try to get non-existent key
+	val, found := m.Get(key2)
+	assert.False(t, found)
+	assert.Nil(t, val)
+
+	// Get from empty map
+	m2 := NewFixedBlockMap[testValue](10)
+	val2, found2 := m2.Get(key1)
+	assert.False(t, found2)
+	assert.Nil(t, val2)
+}
+
+func TestFixedBlockMap_Delete(t *testing.T) {
+	m := NewFixedBlockMap[testValue](10)
+
+	var key1, key2 FixedBlockKey
+	key1.FromString("key1")
+	key2.FromString("key2")
+
+	// Put two keys
+	value1 := testValue{ID: 1, Score: 100, Flags: 0x01, Data: [4]byte{1, 2, 3, 4}}
+	err := m.Put(key1, value1)
+	require.NoError(t, err)
+	value2 := testValue{ID: 2, Score: 200, Flags: 0x02, Data: [4]byte{5, 6, 7, 8}}
+	err = m.Put(key2, value2)
+	require.NoError(t, err)
+
+	// Verify both exist
+	val1, found1 := m.Get(key1)
+	require.True(t, found1)
+	assert.Equal(t, value1, *val1)
+
+	val2, found2 := m.Get(key2)
+	require.True(t, found2)
+	assert.Equal(t, value2, *val2)
+
+	// Delete one key
+	m.Delete(key1)
+
+	// Verify deleted key is gone
+	val, found := m.Get(key1)
+	assert.False(t, found)
+	assert.Nil(t, val)
+
+	// Verify other key still exists
+	val2, found2 = m.Get(key2)
+	require.True(t, found2)
+	assert.Equal(t, value2, *val2)
+
+	// Delete non-existent key (should not panic)
+	m.Delete(key1)
+
+	// Delete the remaining key
+	m.Delete(key2)
+	val, found = m.Get(key2)
+	assert.False(t, found)
+	assert.Nil(t, val)
+}
+
+func TestFixedBlockMap_DeleteAndReinsert(t *testing.T) {
+	m := NewFixedBlockMap[testValue](10)
+
+	var key FixedBlockKey
+	key.FromString("test_key")
+
+	// Put, delete, then put again
+	value1 := testValue{ID: 1, Score: 100, Flags: 0x01, Data: [4]byte{1, 2, 3, 4}}
+	err := m.Put(key, value1)
+	require.NoError(t, err)
+
+	m.Delete(key)
+
+	val, found := m.Get(key)
+	assert.False(t, found)
+	assert.Nil(t, val)
+
+	// Reinsert after delete
+	value2 := testValue{ID: 2, Score: 200, Flags: 0x02, Data: [4]byte{5, 6, 7, 8}}
+	err = m.Put(key, value2)
+	require.NoError(t, err)
+
+	val, found = m.Get(key)
+	require.True(t, found)
+	assert.Equal(t, value2, *val)
+}
+
+func TestFixedBlockMap_MultipleOperations(t *testing.T) {
+	m := NewFixedBlockMap[testValue](50)
+
+	// Insert multiple keys
+	keys := make([]FixedBlockKey, 20)
+	for i := 0; i < 20; i++ {
+		keys[i].FromString(string(rune('a' + i)))
+		value := testValue{ID: uint64(i), Score: int32(i * 10), Flags: uint16(i), Data: [4]byte{byte(i), byte(i + 1), byte(i + 2), byte(i + 3)}}
+		err := m.Put(keys[i], value)
+		require.NoError(t, err)
+	}
+
+	// Verify all keys exist with correct values
+	for i := 0; i < 20; i++ {
+		val, found := m.Get(keys[i])
+		require.True(t, found)
+		expected := testValue{ID: uint64(i), Score: int32(i * 10), Flags: uint16(i), Data: [4]byte{byte(i), byte(i + 1), byte(i + 2), byte(i + 3)}}
+		assert.Equal(t, expected, *val)
+	}
+
+	// Update some values
+	updated0 := testValue{ID: 0, Score: 999, Flags: 0xFF, Data: [4]byte{99, 99, 99, 99}}
+	m.Put(keys[0], updated0)
+	updated10 := testValue{ID: 10, Score: 888, Flags: 0xEE, Data: [4]byte{88, 88, 88, 88}}
+	m.Put(keys[10], updated10)
+
+	// Verify updates
+	val, found := m.Get(keys[0])
+	require.True(t, found)
+	assert.Equal(t, updated0, *val)
+
+	val, found = m.Get(keys[10])
+	require.True(t, found)
+	assert.Equal(t, updated10, *val)
+
+	// Delete some keys
+	m.Delete(keys[5])
+	m.Delete(keys[15])
+
+	// Verify deletions
+	val, found = m.Get(keys[5])
+	assert.False(t, found)
+
+	val, found = m.Get(keys[15])
+	assert.False(t, found)
+
+	// Verify others still exist
+	val, found = m.Get(keys[0])
+	require.True(t, found)
+	assert.Equal(t, updated0, *val)
+}
+
+func TestFixedBlockMap_WriteToAndReadFrom(t *testing.T) {
+	m1 := NewFixedBlockMap[testValue](10)
+
+	var key1, key2, key3 FixedBlockKey
+	key1.FromString("key1")
+	key2.FromString("key2")
+	key3.FromString("key3")
+
+	// Put some values
+	value1 := testValue{ID: 1, Score: 100, Flags: 0x01, Data: [4]byte{1, 2, 3, 4}}
+	err := m1.Put(key1, value1)
+	require.NoError(t, err)
+	value2 := testValue{ID: 2, Score: 200, Flags: 0x02, Data: [4]byte{5, 6, 7, 8}}
+	err = m1.Put(key2, value2)
+	require.NoError(t, err)
+	value3 := testValue{ID: 3, Score: 300, Flags: 0x03, Data: [4]byte{9, 10, 11, 12}}
+	err = m1.Put(key3, value3)
+	require.NoError(t, err)
+
+	// Write to buffer
+	var buf bytes.Buffer
+	written, err := m1.WriteTo(&buf)
+	require.NoError(t, err)
+	assert.Greater(t, written, int64(0))
+
+	// Create new map with same capacity and read from buffer
+	m2 := NewFixedBlockMap[testValue](10)
+	read, err := m2.ReadFrom(&buf)
+	require.NoError(t, err)
+	assert.Equal(t, written, read)
+
+	// Verify all values are preserved
+	val1, found1 := m2.Get(key1)
+	require.True(t, found1)
+	assert.Equal(t, value1, *val1)
+
+	val2, found2 := m2.Get(key2)
+	require.True(t, found2)
+	assert.Equal(t, value2, *val2)
+
+	val3, found3 := m2.Get(key3)
+	require.True(t, found3)
+	assert.Equal(t, value3, *val3)
+}
