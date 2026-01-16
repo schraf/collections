@@ -357,3 +357,80 @@ func TestFixedBlockMap_Iter(t *testing.T) {
 		}
 	}
 }
+
+func TestFixedBlockMap_Rehash(t *testing.T) {
+	m := NewFixedBlockMap[testValue](50)
+
+	// Insert multiple keys
+	keys := make([]FixedBlockKey, 20)
+	expectedValues := make([]testValue, 20)
+	for i := 0; i < 20; i++ {
+		keys[i].FromString(fmt.Sprintf("key%d", i))
+		expectedValues[i] = testValue{
+			ID:    uint64(i),
+			Score: int32(i * 10),
+			Flags: uint16(i),
+			Data:  [4]byte{byte(i), byte(i + 1), byte(i + 2), byte(i + 3)},
+		}
+		err := m.Put(keys[i], expectedValues[i])
+		require.NoError(t, err)
+	}
+
+	// Delete some keys to create tombstone slots
+	m.Delete(keys[3])
+	m.Delete(keys[7])
+	m.Delete(keys[11])
+	m.Delete(keys[15])
+
+	// Verify deleted keys are gone
+	val, found := m.Get(keys[3])
+	assert.False(t, found)
+	assert.Nil(t, val)
+
+	// Verify some remaining keys still exist
+	val, found = m.Get(keys[0])
+	require.True(t, found)
+	assert.Equal(t, expectedValues[0], *val)
+
+	val, found = m.Get(keys[10])
+	require.True(t, found)
+	assert.Equal(t, expectedValues[10], *val)
+
+	// Perform rehash
+	err := m.Rehash()
+	require.NoError(t, err)
+
+	// Verify all remaining entries are still accessible after rehash
+	for i := 0; i < 20; i++ {
+		if i == 3 || i == 7 || i == 11 || i == 15 {
+			// Deleted entries should still be gone
+			val, found = m.Get(keys[i])
+			assert.False(t, found, "Deleted key %d should not be found after rehash", i)
+			assert.Nil(t, val)
+		} else {
+			// All other entries should still be present
+			val, found = m.Get(keys[i])
+			require.True(t, found, "Key %d should be found after rehash", i)
+			assert.Equal(t, expectedValues[i], *val, "Key %d should have correct value after rehash", i)
+		}
+	}
+
+	// Verify iteration still works correctly after rehash
+	var iteratedValues []testValue
+	for v := range m.Iter() {
+		iteratedValues = append(iteratedValues, *v)
+	}
+	// Should have 16 values (20 - 4 deleted)
+	assert.Equal(t, 16, len(iteratedValues))
+
+	// Verify we can still insert new entries after rehash
+	var newKey FixedBlockKey
+	newKey.FromString("new_key_after_rehash")
+	newValue := testValue{ID: 999, Score: 999, Flags: 0xFF, Data: [4]byte{99, 99, 99, 99}}
+	err = m.Put(newKey, newValue)
+	require.NoError(t, err)
+
+	val, found = m.Get(newKey)
+	require.True(t, found)
+	assert.Equal(t, newValue, *val)
+}

@@ -74,7 +74,7 @@ func (m *FixedBlockMap[V]) Iter() iter.Seq[*V] {
 
 			for i := 0; i < FixedBlockSize; i++ {
 				// Skip empty and deleted slots
-				if block.control[i] != 0x0 && block.control[i] != 0x01 {
+				if block.control[i] != 0x0 && block.control[i] != 0x1 {
 					if !yield(&block.values[i]) {
 						return
 					}
@@ -176,7 +176,7 @@ func (m *FixedBlockMap[V]) Put(key FixedBlockKey, value V) error {
 
 				return nil
 			}
-			if block.control[i] == 0x01 && firstDeletedBlock == nil {
+			if block.control[i] == 0x1 && firstDeletedBlock == nil {
 				firstDeletedBlock = block
 				firstDeletedIndex = i
 			}
@@ -222,6 +222,94 @@ func (m *FixedBlockMap[V]) Delete(key FixedBlockKey) {
 
 		blockIndex = (blockIndex + 1) & m.mask
 	}
+}
+
+// Rehash removes all deleted slots and rehashes all entries to optimize lookup performance.
+// This function performs in-place rehashing without allocating additional memory for
+// collecting entries, making it efficient for maps with millions of entries.
+func (m *FixedBlockMap[V]) Rehash() error {
+	// First pass: Convert all deleted slots (0x1) to empty slots (0x0)
+	for blockIndex := range m.blocks {
+		block := &m.blocks[blockIndex]
+		for i := 0; i < FixedBlockSize; i++ {
+			if block.control[i] == 0x1 {
+				block.control[i] = 0x0
+			}
+		}
+	}
+
+	// Second pass: Re-position entries that are not in their optimal location
+	// We iterate through all blocks and slots, and for each valid entry,
+	// check if it should be moved earlier in its probe chain.
+	for blockIndex := range m.blocks {
+		block := &m.blocks[blockIndex]
+		for i := 0; i < FixedBlockSize; i++ {
+			// Skip empty slots
+			if block.control[i] == 0x0 {
+				continue
+			}
+
+			key := block.keys[i]
+			value := block.values[i]
+			optimalBlockIndex := m.hashToBlock(key)
+			currentBlockIndex := uint64(blockIndex)
+
+			// Check if this entry is in its optimal position
+			// An entry is optimal if there are no empty slots in the blocks
+			// between its hash block and its current position
+			isOptimal := true
+
+			// Scan from optimal block to current block
+			probeBlockIndex := optimalBlockIndex
+			for probeBlockIndex != currentBlockIndex {
+				probeBlock := &m.blocks[probeBlockIndex]
+				// If there's any empty slot in this block, the entry is not optimal
+				for j := 0; j < FixedBlockSize; j++ {
+					if probeBlock.control[j] == 0x0 {
+						isOptimal = false
+						break
+					}
+				}
+				if !isOptimal {
+					break
+				}
+				probeBlockIndex = (probeBlockIndex + 1) & m.mask
+				if probeBlockIndex == optimalBlockIndex {
+					// Wrapped around (shouldn't happen), but be safe
+					break
+				}
+			}
+
+			// Also check if there's an empty slot before position i in the current block
+			if isOptimal && currentBlockIndex == optimalBlockIndex {
+				for j := 0; j < i; j++ {
+					if block.control[j] == 0x0 {
+						isOptimal = false
+						break
+					}
+				}
+			}
+
+			if !isOptimal {
+				// Clear the current slot immediately so Put can use it if optimal
+				block.control[i] = 0x0
+
+				// Re-insert using Put, which will find the optimal position
+				// (including potentially the slot we just cleared if it's optimal)
+				if err := m.Put(key, value); err != nil {
+					// Restore the entry if Put fails
+					block.control[i] = key[0] | 0x80
+					return fmt.Errorf("rehash failed during re-insertion: %w", err)
+				}
+
+				// Note: If Put placed the entry back in the same slot, that means
+				// it was already optimal and our check had a false negative.
+				// This is harmless, just slightly inefficient.
+			}
+		}
+	}
+
+	return nil
 }
 
 // WriteTo writes the entire raw memory block of the map to an io.Writer.
