@@ -161,4 +161,4 @@ Consider the standard Go `map` for:
 
 ## License
 
-[Add your license here]
+[See LICENSE file](LICENSE)
