@@ -39,6 +39,22 @@ func (k *FixedBlockKey) FromString(text string) {
 	binary.LittleEndian.PutUint64(k[8:16], h2)
 }
 
+type FixedBlockMapInfo struct {
+	// ratio of stored entities to capacity
+	LoadFactor float32
+
+	// ratio of tombstones to total slots
+	TombstoneFactor float32
+
+	// set to true when TombstoreFactor value indicates that it would
+	// be beneficial to rehash the map
+	RecommendRehash bool
+
+	// set to true when LoadFactor value indicates that it would
+	// be beneficial to grow the map
+	RecommendGrow bool
+}
+
 type FixedBlock[V any] struct {
 	control [FixedBlockSize]uint8
 	keys    [FixedBlockSize]FixedBlockKey
@@ -230,6 +246,42 @@ func (m *FixedBlockMap[V]) Delete(key FixedBlockKey) {
 		}
 
 		blockIndex = (blockIndex + 1) & m.mask
+	}
+}
+
+func (m *FixedBlockMap[V]) CollectInfo() FixedBlockMapInfo {
+	var storedEntities uint64
+	var tombstones uint64
+	totalSlots := m.Capacity()
+
+	// Count stored entities and tombstones
+	for blockIndex := range m.blocks {
+		block := &m.blocks[blockIndex]
+		for i := 0; i < FixedBlockSize; i++ {
+			if block.control[i] == 0x1 {
+				// Tombstone (deleted slot)
+				tombstones++
+			} else if block.control[i] != 0x0 {
+				// Stored entity (non-empty, non-deleted)
+				storedEntities++
+			}
+		}
+	}
+
+	// Calculate factors
+	var loadFactor float32
+	var tombstoneFactor float32
+
+	if totalSlots > 0 {
+		loadFactor = float32(storedEntities) / float32(totalSlots)
+		tombstoneFactor = float32(tombstones) / float32(totalSlots)
+	}
+
+	return FixedBlockMapInfo{
+		LoadFactor:      loadFactor,
+		TombstoneFactor: tombstoneFactor,
+		RecommendGrow:   loadFactor >= 0.75,
+		RecommendRehash: tombstoneFactor >= 0.20,
 	}
 }
 
