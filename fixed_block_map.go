@@ -56,9 +56,20 @@ type FixedBlockMapInfo struct {
 }
 
 type FixedBlock[V any] struct {
-	control [FixedBlockSize]uint8
+	control uint64 // 8 control bytes packed into a single uint64 for fast SIMD-like operations
 	keys    [FixedBlockSize]FixedBlockKey
 	values  [FixedBlockSize]V
+}
+
+// controlByte extracts a single control byte at the given index (0-7)
+func (b *FixedBlock[V]) controlByte(index int) uint8 {
+	return uint8(b.control >> (index * 8))
+}
+
+// setControlByte sets a single control byte at the given index (0-7)
+func (b *FixedBlock[V]) setControlByte(index int, value uint8) {
+	shift := index * 8
+	b.control = (b.control &^ (0xFF << shift)) | (uint64(value) << shift)
 }
 
 type FixedBlockMap[V any] struct {
@@ -99,7 +110,8 @@ func (m *FixedBlockMap[V]) Iter() iter.Seq2[FixedBlockKey, *V] {
 
 			for i := 0; i < FixedBlockSize; i++ {
 				// Skip empty and deleted slots
-				if block.control[i] != 0x0 && block.control[i] != 0x1 {
+				ctrl := block.controlByte(i)
+				if ctrl != 0x0 && ctrl != 0x1 {
 					if !yield(block.keys[i], &block.values[i]) {
 						return
 					}
@@ -119,7 +131,8 @@ func (m *FixedBlockMap[V]) Capacity() uint64 {
 // hashToBlock takes the 16-byte key (already a hash) and returns the starting block index.
 func (m *FixedBlockMap[V]) hashToBlock(key FixedBlockKey) uint64 {
 	// Use the first 8 bytes of the hash-key to pick the block
-	return binary.LittleEndian.Uint64(key[:8]) & m.mask
+	// Direct memory read - assumes little-endian architecture
+	return *(*uint64)(unsafe.Pointer(&key[0])) & m.mask
 }
 
 // Get searches for a 16-byte key
@@ -129,7 +142,7 @@ func (m *FixedBlockMap[V]) Get(key FixedBlockKey) (*V, bool) {
 
 	for {
 		block := &m.blocks[blockIndex]
-		control := binary.LittleEndian.Uint64(block.control[:])
+		control := block.control
 
 		// Parallel search for the tag
 		target := uint64(tag) * 0x0101010101010101
@@ -166,7 +179,7 @@ func (m *FixedBlockMap[V]) Put(key FixedBlockKey, value V) error {
 
 	for {
 		block := &m.blocks[blockIndex]
-		control := binary.LittleEndian.Uint64(block.control[:])
+		control := block.control
 
 		// Check if key already exists (Update)
 		target := uint64(tag) * 0x0101010101010101
@@ -185,23 +198,24 @@ func (m *FixedBlockMap[V]) Put(key FixedBlockKey, value V) error {
 
 		// Look for an empty or deleted slot to insert
 		for i := 0; i < 8; i++ {
-			if block.control[i] == 0x0 {
+			ctrl := block.controlByte(i)
+			if ctrl == 0x0 {
 				// If we found a tombstone earlier, use that instead to keep the chain short
 				if firstDeletedBlock != nil {
-					firstDeletedBlock.control[firstDeletedIndex] = tag
+					firstDeletedBlock.setControlByte(firstDeletedIndex, tag)
 					firstDeletedBlock.keys[firstDeletedIndex] = key
 					firstDeletedBlock.values[firstDeletedIndex] = value
 
 					return nil
 				}
 
-				block.control[i] = tag
+				block.setControlByte(i, tag)
 				block.keys[i] = key
 				block.values[i] = value
 
 				return nil
 			}
-			if block.control[i] == 0x1 && firstDeletedBlock == nil {
+			if ctrl == 0x1 && firstDeletedBlock == nil {
 				firstDeletedBlock = block
 				firstDeletedIndex = i
 			}
@@ -224,7 +238,7 @@ func (m *FixedBlockMap[V]) Delete(key FixedBlockKey) {
 
 	for {
 		block := &m.blocks[blockIndex]
-		control := binary.LittleEndian.Uint64(block.control[:])
+		control := block.control
 
 		target := uint64(tag) * 0x0101010101010101
 		match := control ^ target
@@ -233,7 +247,7 @@ func (m *FixedBlockMap[V]) Delete(key FixedBlockKey) {
 		for result != 0 {
 			index := bits.TrailingZeros64(result) / 8
 			if block.keys[index] == key {
-				block.control[index] = 0x1
+				block.setControlByte(index, 0x1)
 				return
 			}
 
@@ -258,10 +272,11 @@ func (m *FixedBlockMap[V]) CollectInfo() FixedBlockMapInfo {
 	for blockIndex := range m.blocks {
 		block := &m.blocks[blockIndex]
 		for i := 0; i < FixedBlockSize; i++ {
-			if block.control[i] == 0x1 {
+			ctrl := block.controlByte(i)
+			if ctrl == 0x1 {
 				// Tombstone (deleted slot)
 				tombstones++
-			} else if block.control[i] != 0x0 {
+			} else if ctrl != 0x0 {
 				// Stored entity (non-empty, non-deleted)
 				storedEntities++
 			}
@@ -295,8 +310,8 @@ func (m *FixedBlockMap[V]) Rehash() error {
 	for blockIndex := range m.blocks {
 		block := &m.blocks[blockIndex]
 		for i := 0; i < FixedBlockSize; i++ {
-			if block.control[i] == 0x1 {
-				block.control[i] = 0x0
+			if block.controlByte(i) == 0x1 {
+				block.setControlByte(i, 0x0)
 			}
 		}
 	}
@@ -319,7 +334,7 @@ func (m *FixedBlockMap[V]) Rehash() error {
 	BlockScanLoop:
 		for i := 0; i < FixedBlockSize; i++ {
 			// Skip empty slots
-			if block.control[i] == 0x0 {
+			if block.controlByte(i) == 0x0 {
 				continue
 			}
 
@@ -337,16 +352,16 @@ func (m *FixedBlockMap[V]) Rehash() error {
 			optimalBlock := &m.blocks[optimalBlockIndex]
 
 			for j := 0; j < FixedBlockSize; j++ {
-				if optimalBlock.control[j] == 0x0 {
+				if optimalBlock.controlByte(j) == 0x0 {
 					tag := key[0] | 0x80
 
 					// place the entry into the optimal block
-					optimalBlock.control[j] = tag
+					optimalBlock.setControlByte(j, tag)
 					optimalBlock.keys[j] = key
 					optimalBlock.values[j] = value
 
 					// clear the current slot
-					block.control[i] = 0x0
+					block.setControlByte(i, 0x0)
 
 					// mark that we have successfully rehashed an entry
 					rehashedSinceLastReinsertAttempt++
@@ -362,7 +377,7 @@ func (m *FixedBlockMap[V]) Rehash() error {
 			})
 
 			// clear the slot in this block
-			block.control[i] = 0x0
+			block.setControlByte(i, 0x0)
 		}
 
 		// Iterate through the reinsert list and try to place entries that can
@@ -376,11 +391,11 @@ func (m *FixedBlockMap[V]) Rehash() error {
 
 				// Check if optimal block now has empty slots
 				for j := 0; j < FixedBlockSize; j++ {
-					if optimalBlock.control[j] == 0x0 {
+					if optimalBlock.controlByte(j) == 0x0 {
 						tag := entry.key[0] | 0x80
 
 						// Place the entry into the optimal block
-						optimalBlock.control[j] = tag
+						optimalBlock.setControlByte(j, tag)
 						optimalBlock.keys[j] = entry.key
 						optimalBlock.values[j] = entry.value
 

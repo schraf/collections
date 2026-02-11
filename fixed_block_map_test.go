@@ -573,3 +573,37 @@ func TestFixedBlockMap_Grow(t *testing.T) {
 	require.True(t, found)
 	assert.Equal(t, newValue, *val)
 }
+
+func BenchmarkFixedBlockMap_Get(b *testing.B) {
+	m := NewFixedBlockMap[testValue](100000)
+
+	// Pre-populate the map with 50000 entries
+	keys := make([]FixedBlockKey, 50000)
+	for i := 0; i < 50000; i++ {
+		keys[i].FromString(fmt.Sprintf("bench_key_%d", i))
+		value := testValue{ID: uint64(i), Score: int32(i * 10), Flags: uint16(i), Data: [4]byte{byte(i), byte(i + 1), byte(i + 2), byte(i + 3)}}
+		m.Put(keys[i], value)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Access keys in a pattern to simulate real workload
+		key := keys[i%50000]
+		m.Get(key)
+	}
+}
+
+func BenchmarkFixedBlockMap_Put(b *testing.B) {
+	m := NewFixedBlockMap[testValue](uint64(b.N) + 1000)
+
+	keys := make([]FixedBlockKey, b.N)
+	for i := 0; i < b.N; i++ {
+		keys[i].FromString(fmt.Sprintf("bench_key_%d", i))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		value := testValue{ID: uint64(i), Score: int32(i * 10), Flags: uint16(i), Data: [4]byte{byte(i), byte(i + 1), byte(i + 2), byte(i + 3)}}
+		m.Put(keys[i], value)
+	}
+}
