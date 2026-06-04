@@ -262,6 +262,144 @@ Consider the standard Go `map` for:
 - String keys without conversion
 - Simpler API needs
 
+## CSR
+
+`CSR` is a compact, immutable adjacency structure in compressed-sparse-row form, designed to hold the topology of very large directed graphs (tens of millions of nodes, hundreds of millions of edges) resident in memory at minimal cost.
+
+### Features
+
+- **Compressed-sparse-row layout**: edges are stored as three parallel arrays (`offsets`, `neighbors`, `labels`) over dense node indices, with no per-node or per-edge pointers — cache-friendly and GC-light
+- **Generic**: parameterized over the external node identifier `N` and edge label `L` (both `comparable`)
+- **Dictionary-encoded labels**: each distinct edge label is interned to a one-byte code, so labels cost a single byte per edge (up to `MaxCSRLabels` = 256 distinct labels)
+- **Immutable after build**: a built `CSR` is safe for concurrent reads; reflect mutations by building a new one and swapping it in
+- **Builder-based construction**: accumulate edges via a builder that assigns dense indices lazily, then `Build()` into the final compact form
+- **Bidirectional view**: `BiCSR` holds outbound and inbound adjacencies over a shared dense-index space, the typical shape for graph traversal
+- **Allocation-free iteration**: `Neighbors` returns a range-over-func iterator yielding `(neighborDense, labelCode)` pairs
+
+### Design
+
+A directed graph is stored over dense node indices `[0, N)`:
+
+```
+offsets   len N+1   offsets[i]..offsets[i+1] is node i's slice of edges
+neighbors len E     destination dense index of each edge
+labels    len E     dictionary-encoded edge label of each edge
+```
+
+External node ids are mapped to dense indices via an internal map, with a reverse slice (`denseToID`) for hydrating results. Edge labels are interned to `uint8` codes. A node's outgoing edges are the contiguous range `neighbors[offsets[i]:offsets[i+1]]` with parallel `labels`.
+
+`BiCSR` builds two such structures from one edge stream so that a given external id resolves to the same dense index in both the outbound and inbound directions, allowing a traversal to carry dense indices across direction changes without re-resolving.
+
+### Usage
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/schraf/collections"
+)
+
+func main() {
+	// Build a bidirectional graph: 1 -> 2 -> 3, plus 1 -> 3.
+	b := collections.NewBiCSRBuilder[int64, string](0, 0)
+	b.AddEdge(1, 2, "depends_on")
+	b.AddEdge(2, 3, "depends_on")
+	b.AddEdge(1, 3, "built_from")
+
+	g, err := b.Build()
+	if err != nil {
+		panic(err)
+	}
+
+	// Traverse outbound neighbors of node 1, filtering by label.
+	start, ok := g.Dense(1)
+	if !ok {
+		panic("node 1 missing")
+	}
+
+	for nb, label := range g.Out().Neighbors(start) {
+		fmt.Printf("1 -%s-> %d\n", g.Out().Label(label), g.Out().ID(nb))
+	}
+
+	// Inbound neighbors of node 3 (who points at it).
+	d3, _ := g.In().Dense(3)
+	for nb := range g.In().Neighbors(d3) {
+		fmt.Printf("%d -> 3\n", g.In().ID(nb))
+	}
+}
+```
+
+### API Reference
+
+#### `NewCSRBuilder[N, L comparable](nodeHint, edgeHint int) *CSRBuilder[N, L]`
+
+Creates a single-direction builder. The hints pre-size internal buffers (0 is fine).
+
+#### `(*CSRBuilder).AddNode(id N) int32`
+
+Ensures `id` has a dense index (for registering isolated nodes), returning it.
+
+#### `(*CSRBuilder).AddEdge(src, dst N, label L)`
+
+Records a directed edge. Endpoints are registered if new. Errors (e.g. exceeding `MaxCSRLabels`) are recorded and surfaced by `Build`.
+
+#### `(*CSRBuilder).Build() (*CSR[N, L], error)`
+
+Produces the immutable `CSR` and releases the builder's accumulation buffers. The builder must not be reused afterward.
+
+#### `NewBiCSRBuilder[N, L comparable](nodeHint, edgeHint int) *BiCSRBuilder[N, L]`
+
+Creates a bidirectional builder with the same `AddNode`/`AddEdge`/`Build` API, producing a `BiCSR`.
+
+#### `(*CSR).Dense(id N) (int32, bool)` / `(*CSR).ID(dense int32) N`
+
+Convert between external node ids and dense indices.
+
+#### `(*CSR).LabelCode(label L) (uint8, bool)` / `(*CSR).Label(code uint8) L`
+
+Convert between external labels and internal codes.
+
+#### `(*CSR).Degree(dense int32) int`
+
+Number of outgoing edges of a dense node.
+
+#### `(*CSR).Row(dense int32) (neighbors []int32, labels []uint8)`
+
+Returns the neighbor and label slices for a node. The slices alias internal arrays and must not be modified.
+
+#### `(*CSR).Neighbors(dense int32) func(yield func(neighbor int32, label uint8) bool)`
+
+Returns a range-over-func iterator over a node's edges, allocation-free and break-able.
+
+#### `(*BiCSR).Out() *CSR[N, L]` / `(*BiCSR).In() *CSR[N, L]`
+
+The outbound (keyed on source) and inbound (keyed on target) adjacencies, sharing a dense-index space.
+
+### Performance Characteristics
+
+- **Neighbor lookup**: O(degree), sequential scan of contiguous arrays with excellent cache locality
+- **Build**: O(V + E) via degree counting and a prefix-sum fill, single allocation per array
+- **Memory**: roughly `(N+1 + E)·4` bytes for offsets+neighbors plus `E` bytes for labels, per direction, plus the id↔dense maps
+
+### Limitations
+
+- Immutable after `Build`; mutations require rebuilding
+- At most `MaxCSRLabels` (256) distinct edge labels, due to one-byte label encoding
+- Dense indices are `int32`, bounding a single CSR to ~2.1 billion nodes/edges
+
+### When to Use
+
+`CSR` is ideal for:
+- Holding a large, read-mostly graph topology resident in memory
+- Repeated traversals (BFS/DFS) where per-hop neighbor lookups must be fast
+- Workloads where graph structure changes infrequently (rebuild-and-swap)
+
+Consider an adjacency-list or map-of-slices for:
+- Frequently mutated graphs
+- Small graphs where construction overhead and immutability are not worth it
+
 ## License
 
 [See LICENSE file](LICENSE)
