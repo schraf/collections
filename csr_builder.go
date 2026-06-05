@@ -10,7 +10,7 @@ import "fmt"
 // an edge endpoint or via AddNode. Edge labels are interned to a one-byte code
 // in first-seen order.
 type CSRBuilder[N comparable, L comparable] struct {
-	denseToID []N
+	denseToId []N
 	idToDense map[N]int32
 
 	labelToCode map[L]uint8
@@ -30,6 +30,12 @@ func errTooManyCSRLabels() error {
 	return fmt.Errorf("collections: csr has too many distinct labels (max %d)", MaxCSRLabels)
 }
 
+// errCSRDataLength is returned when a per-edge payload slice does not match the
+// number of accumulated edges.
+func errCSRDataLength(got, want int) error {
+	return fmt.Errorf("collections: csr edge data length %d does not match edge count %d", got, want)
+}
+
 // NewCSRBuilder returns an empty CSRBuilder. nodeHint and edgeHint pre-size
 // internal buffers for the expected node and edge counts (0 is fine).
 func NewCSRBuilder[N comparable, L comparable](nodeHint, edgeHint int) *CSRBuilder[N, L] {
@@ -41,7 +47,7 @@ func NewCSRBuilder[N comparable, L comparable](nodeHint, edgeHint int) *CSRBuild
 	}
 
 	return &CSRBuilder[N, L]{
-		denseToID:   make([]N, 0, nodeHint),
+		denseToId:   make([]N, 0, nodeHint),
 		idToDense:   make(map[N]int32, nodeHint),
 		labelToCode: make(map[L]uint8),
 		srcs:        make([]int32, 0, edgeHint),
@@ -81,7 +87,7 @@ func (b *CSRBuilder[N, L]) AddEdge(src, dst N, label L) {
 }
 
 // NumNodes returns the number of distinct nodes seen so far.
-func (b *CSRBuilder[N, L]) NumNodes() int { return len(b.denseToID) }
+func (b *CSRBuilder[N, L]) NumNodes() int { return len(b.denseToId) }
 
 // NumEdges returns the number of edges accumulated so far.
 func (b *CSRBuilder[N, L]) NumEdges() int { return len(b.srcs) }
@@ -90,9 +96,9 @@ func (b *CSRBuilder[N, L]) dense(id N) int32 {
 	if d, ok := b.idToDense[id]; ok {
 		return d
 	}
-	d := int32(len(b.denseToID))
+	d := int32(len(b.denseToId))
 	b.idToDense[id] = d
-	b.denseToID = append(b.denseToID, id)
+	b.denseToId = append(b.denseToId, id)
 	return d
 }
 
@@ -104,13 +110,13 @@ func (b *CSRBuilder[N, L]) Build() (*CSR[N, L], error) {
 		return nil, b.err
 	}
 
-	offsets, neighbors, labels := fillCSR(len(b.denseToID), b.srcs, b.dsts, b.labels)
+	layout := fillCSR(len(b.denseToId), b.srcs, b.dsts, b.labels)
 
 	c := &CSR[N, L]{
-		offsets:     offsets,
-		neighbors:   neighbors,
-		labels:      labels,
-		denseToID:   b.denseToID,
+		offsets:     layout.offsets,
+		neighbors:   layout.neighbors,
+		labels:      layout.labels,
+		denseToId:   b.denseToId,
 		idToDense:   b.idToDense,
 		labelToCode: b.labelToCode,
 		codeToLabel: b.codeToLabel,
@@ -121,7 +127,7 @@ func (b *CSRBuilder[N, L]) Build() (*CSR[N, L], error) {
 	b.srcs = nil
 	b.dsts = nil
 	b.labels = nil
-	b.denseToID = nil
+	b.denseToId = nil
 	b.idToDense = nil
 	b.labelToCode = nil
 	b.codeToLabel = nil

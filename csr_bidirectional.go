@@ -28,14 +28,14 @@ func (b *BiCSR[N, L]) NumEdges() int { return b.out.NumEdges() }
 // Dense resolves an external node id to its shared dense index.
 func (b *BiCSR[N, L]) Dense(id N) (int32, bool) { return b.out.Dense(id) }
 
-// ID resolves a shared dense index to its external node id.
-func (b *BiCSR[N, L]) ID(dense int32) N { return b.out.ID(dense) }
+// NodeId resolves a shared dense index to its external node id.
+func (b *BiCSR[N, L]) NodeId(dense int32) N { return b.out.NodeId(dense) }
 
 // BiCSRBuilder accumulates edges once and produces a BiCSR whose outbound and
 // inbound CSRs share a single dense-index and label space. Not safe for
 // concurrent use.
 type BiCSRBuilder[N comparable, L comparable] struct {
-	denseToID []N
+	denseToId []N
 	idToDense map[N]int32
 
 	labelToCode map[L]uint8
@@ -58,7 +58,7 @@ func NewBiCSRBuilder[N comparable, L comparable](nodeHint, edgeHint int) *BiCSRB
 	}
 
 	return &BiCSRBuilder[N, L]{
-		denseToID:   make([]N, 0, nodeHint),
+		denseToId:   make([]N, 0, nodeHint),
 		idToDense:   make(map[N]int32, nodeHint),
 		labelToCode: make(map[L]uint8),
 		srcs:        make([]int32, 0, edgeHint),
@@ -94,7 +94,7 @@ func (b *BiCSRBuilder[N, L]) AddEdge(src, dst N, label L) {
 }
 
 // NumNodes returns the number of distinct nodes seen so far.
-func (b *BiCSRBuilder[N, L]) NumNodes() int { return len(b.denseToID) }
+func (b *BiCSRBuilder[N, L]) NumNodes() int { return len(b.denseToId) }
 
 // NumEdges returns the number of edges accumulated so far.
 func (b *BiCSRBuilder[N, L]) NumEdges() int { return len(b.srcs) }
@@ -103,9 +103,9 @@ func (b *BiCSRBuilder[N, L]) dense(id N) int32 {
 	if d, ok := b.idToDense[id]; ok {
 		return d
 	}
-	d := int32(len(b.denseToID))
+	d := int32(len(b.denseToId))
 	b.idToDense[id] = d
-	b.denseToID = append(b.denseToID, id)
+	b.denseToId = append(b.denseToId, id)
 	return d
 }
 
@@ -116,25 +116,59 @@ func (b *BiCSRBuilder[N, L]) Build() (*BiCSR[N, L], error) {
 		return nil, b.err
 	}
 
-	numNodes := len(b.denseToID)
+	bi, _, _ := b.build()
+	return bi, nil
+}
 
-	outOffsets, outNeighbors, outLabels := fillCSR(numNodes, b.srcs, b.dsts, b.labels)
-	inOffsets, inNeighbors, inLabels := fillCSR(numNodes, b.dsts, b.srcs, b.labels)
+// BuildBiCSRWithData builds the BiCSR and reorders a caller-supplied per-edge
+// payload slice (in AddEdge order, len == builder.NumEdges()) into both the
+// outbound and inbound CSR flat-position orders. The returned outData is
+// parallel to the outbound CSR's neighbors/labels; inData to the inbound CSR's.
+// Look them up via the CSR's EdgeRange/Edges. This lets callers attach per-edge
+// data (e.g. a database id) without a separate map, while keeping the builder
+// and CSR types free of a payload type parameter.
+//
+// The builder is consumed (as with Build) and must not be reused.
+func BuildBiCSRWithData[N comparable, L comparable, D any](b *BiCSRBuilder[N, L], data []D) (bi *BiCSR[N, L], outData []D, inData []D, err error) {
+	if b.err != nil {
+		return nil, nil, nil, b.err
+	}
+
+	if len(data) != len(b.srcs) {
+		return nil, nil, nil, errCSRDataLength(len(data), len(b.srcs))
+	}
+
+	bi, outPerm, inPerm := b.build()
+
+	outData = PermuteCSRData(data, outPerm)
+	inData = PermuteCSRData(data, inPerm)
+
+	return bi, outData, inData, nil
+}
+
+// build is the shared core of Build/BuildBiCSRWithData. It produces the BiCSR
+// and the per-direction accumulation→position permutations (outPerm aligns with
+// the outbound CSR's flat positions; inPerm with the inbound CSR's).
+func (b *BiCSRBuilder[N, L]) build() (bi *BiCSR[N, L], outPerm []int32, inPerm []int32) {
+	numNodes := len(b.denseToId)
+
+	outLayout := fillCSR(numNodes, b.srcs, b.dsts, b.labels)
+	inLayout := fillCSR(numNodes, b.dsts, b.srcs, b.labels)
 
 	out := &CSR[N, L]{
-		offsets:     outOffsets,
-		neighbors:   outNeighbors,
-		labels:      outLabels,
-		denseToID:   b.denseToID,
+		offsets:     outLayout.offsets,
+		neighbors:   outLayout.neighbors,
+		labels:      outLayout.labels,
+		denseToId:   b.denseToId,
 		idToDense:   b.idToDense,
 		labelToCode: b.labelToCode,
 		codeToLabel: b.codeToLabel,
 	}
 	in := &CSR[N, L]{
-		offsets:     inOffsets,
-		neighbors:   inNeighbors,
-		labels:      inLabels,
-		denseToID:   b.denseToID,
+		offsets:     inLayout.offsets,
+		neighbors:   inLayout.neighbors,
+		labels:      inLayout.labels,
+		denseToId:   b.denseToId,
 		idToDense:   b.idToDense,
 		labelToCode: b.labelToCode,
 		codeToLabel: b.codeToLabel,
@@ -143,10 +177,10 @@ func (b *BiCSRBuilder[N, L]) Build() (*BiCSR[N, L], error) {
 	b.srcs = nil
 	b.dsts = nil
 	b.labels = nil
-	b.denseToID = nil
+	b.denseToId = nil
 	b.idToDense = nil
 	b.labelToCode = nil
 	b.codeToLabel = nil
 
-	return &BiCSR[N, L]{out: out, in: in}, nil
+	return &BiCSR[N, L]{out: out, in: in}, outLayout.perm, inLayout.perm
 }

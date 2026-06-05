@@ -25,7 +25,7 @@ func outNeighborsOf(t *testing.T, c *CSR[int64, string], id int64) []csrNeighbor
 	var out []csrNeighbor
 	nbrs, labels := c.Row(dense)
 	for i, nb := range nbrs {
-		out = append(out, csrNeighbor{id: c.ID(nb), label: c.Label(labels[i])})
+		out = append(out, csrNeighbor{id: c.NodeId(nb), label: c.Label(labels[i])})
 	}
 
 	sort.Slice(out, func(i, j int) bool {
@@ -68,7 +68,7 @@ func TestCSRBuildAndQuery(t *testing.T) {
 	assert.Equal(t, 0, c.Degree(d3))
 }
 
-func TestCSRRoundTripIDAndLabel(t *testing.T) {
+func TestCSRRoundTripIdAndLabel(t *testing.T) {
 	b := NewCSRBuilder[int64, string](0, 0)
 	b.AddEdge(10, 20, "x")
 	c, err := b.Build()
@@ -76,7 +76,7 @@ func TestCSRRoundTripIDAndLabel(t *testing.T) {
 
 	d, ok := c.Dense(10)
 	require.True(t, ok)
-	assert.Equal(t, int64(10), c.ID(d))
+	assert.Equal(t, int64(10), c.NodeId(d))
 
 	code, ok := c.LabelCode("x")
 	require.True(t, ok)
@@ -140,7 +140,7 @@ func TestCSRNeighborsIteratorFull(t *testing.T) {
 
 	seen := map[int64]string{}
 	for nb, label := range c.Neighbors(d) {
-		seen[c.ID(nb)] = c.Label(label)
+		seen[c.NodeId(nb)] = c.Label(label)
 	}
 	assert.Equal(t, map[int64]string{2: "a", 3: "b"}, seen)
 }
