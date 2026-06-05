@@ -275,6 +275,7 @@ Consider the standard Go `map` for:
 - **Builder-based construction**: accumulate edges via a builder that assigns dense indices lazily, then `Build()` into the final compact form
 - **Bidirectional view**: `BiCSR` holds outbound and inbound adjacencies over a shared dense-index space, the typical shape for graph traversal
 - **Allocation-free iteration**: `Neighbors` returns a range-over-func iterator yielding `(neighborDense, labelCode)` pairs
+- **Per-edge payload support**: attach arbitrary per-edge payloads (such as edge IDs, weights, or attributes) without storing them in a map or adding a payload type parameter, by indexing simple parallel slices with stable flat edge positions using `EdgeRange` and `BuildBiCSRWithData`
 
 ### Design
 
@@ -286,9 +287,15 @@ neighbors len E     destination dense index of each edge
 labels    len E     dictionary-encoded edge label of each edge
 ```
 
-External node ids are mapped to dense indices via an internal map, with a reverse slice (`denseToID`) for hydrating results. Edge labels are interned to `uint8` codes. A node's outgoing edges are the contiguous range `neighbors[offsets[i]:offsets[i+1]]` with parallel `labels`.
+External node ids are mapped to dense indices via an internal map, with a reverse slice (`denseToId`) for hydrating results. Edge labels are interned to `uint8` codes. A node's outgoing edges are the contiguous range `neighbors[offsets[i]:offsets[i+1]]` with parallel `labels`.
 
 `BiCSR` builds two such structures from one edge stream so that a given external id resolves to the same dense index in both the outbound and inbound directions, allowing a traversal to carry dense indices across direction changes without re-resolving.
+
+#### Edge Payload Mapping
+
+Because every edge has a stable flat position in `[0, E)` within the CSR's contiguous arrays, you can associate arbitrary edge attributes (e.g. edge IDs, weights, or timestamps) with edges without storing them in maps or adding generic payload type parameters. You simply maintain a parallel slice of length `E` containing your data, and index into it using the flat positions returned by `EdgeRange(dense)`.
+
+For bidirectional graphs, since the outbound and inbound edges are sorted differently, a builder-order payload slice must be permuted separately for each direction. The `BuildBiCSRWithData` helper automates this process, returning a built `BiCSR` alongside outbound-aligned and inbound-aligned payload slices.
 
 ### Usage
 
@@ -320,13 +327,67 @@ func main() {
 	}
 
 	for nb, label := range g.Out().Neighbors(start) {
-		fmt.Printf("1 -%s-> %d\n", g.Out().Label(label), g.Out().ID(nb))
+		fmt.Printf("1 -%s-> %d\n", g.Out().Label(label), g.Out().NodeId(nb))
 	}
 
 	// Inbound neighbors of node 3 (who points at it).
 	d3, _ := g.In().Dense(3)
 	for nb := range g.In().Neighbors(d3) {
-		fmt.Printf("%d -> 3\n", g.In().ID(nb))
+		fmt.Printf("%d -> 3\n", g.In().NodeId(nb))
+	}
+}
+```
+
+### Bidirectional Graph with Edge Payloads
+
+If your edges have associated attributes (like unique edge IDs, weights, or timestamps), you can use `BuildBiCSRWithData` to automatically align those attributes into outbound and inbound slices matching the flat edge indices of each direction:
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/schraf/collections"
+)
+
+func main() {
+	b := collections.NewBiCSRBuilder[int64, string](0, 0)
+	
+	// Add edges in sequence
+	b.AddEdge(1, 2, "depends_on") // Index 0
+	b.AddEdge(2, 3, "depends_on") // Index 1
+	b.AddEdge(1, 3, "built_from") // Index 2
+
+	// Payloads parallel to the AddEdge calls
+	edgeIDs := []int64{100, 101, 102}
+
+	// Build the graph and reorder the edge payload slice for both directions
+	g, outIDs, inIDs, err := collections.BuildBiCSRWithData(b, edgeIDs)
+	if err != nil {
+		panic(err)
+	}
+
+	// Traverse outbound neighbors of node 1 with edge payloads
+	d1, _ := g.Dense(1)
+	start, _ := g.Out().EdgeRange(d1)
+	
+	k := int32(0)
+	for nb, label := range g.Out().Neighbors(d1) {
+		edgeID := outIDs[start+k]
+		fmt.Printf("1 -[ID:%d, Label:%s]-> %d\n", edgeID, g.Out().Label(label), g.Out().NodeId(nb))
+		k++
+	}
+
+	// Traverse inbound neighbors of node 3 with edge payloads
+	d3, _ := g.Dense(3)
+	inStart, _ := g.In().EdgeRange(d3)
+	
+	inK := int32(0)
+	for nb := range g.In().Neighbors(d3) {
+		edgeID := inIDs[inStart+inK]
+		fmt.Printf("%d -[ID:%d]-> 3\n", g.In().NodeId(nb), edgeID)
+		inK++
 	}
 }
 ```
@@ -353,7 +414,15 @@ Produces the immutable `CSR` and releases the builder's accumulation buffers. Th
 
 Creates a bidirectional builder with the same `AddNode`/`AddEdge`/`Build` API, producing a `BiCSR`.
 
-#### `(*CSR).Dense(id N) (int32, bool)` / `(*CSR).ID(dense int32) N`
+#### `BuildBiCSRWithData[N, L comparable, D any](b *BiCSRBuilder[N, L], data []D) (bi *BiCSR[N, L], outData, inData []D, err error)`
+
+Builds a `BiCSR` and reorders a caller-supplied per-edge payload slice `data` (which must be in the same order as the builder's `AddEdge` calls) into both the outbound and inbound CSR flat-position orders. The returned `outData` aligns with the outbound CSR's flat positions (retrieved via `EdgeRange`), and `inData` aligns with the inbound CSR's. This consumes the builder like `Build()`.
+
+#### `PermuteCSRData[D any](data []D, perm []int32) []D`
+
+Reorders a per-edge payload slice (in edge-accumulation/`AddEdge` order) into a CSR's flat-position order using the permutation indices returned by the internal builder layout.
+
+#### `(*CSR).Dense(id N) (int32, bool)` / `(*CSR).NodeId(dense int32) N`
 
 Convert between external node ids and dense indices.
 
@@ -372,6 +441,10 @@ Returns the neighbor and label slices for a node. The slices alias internal arra
 #### `(*CSR).Neighbors(dense int32) func(yield func(neighbor int32, label uint8) bool)`
 
 Returns a range-over-func iterator over a node's edges, allocation-free and break-able.
+
+#### `(*CSR).EdgeRange(dense int32) (start, end int32)`
+
+Returns the stable half-open range `[start, end)` of flat edge positions for a dense node. The node's `k`-th edge is at flat position `start + k`. These positions can be used to index parallel user-allocated payload slices (like edge weights or IDs).
 
 #### `(*BiCSR).Out() *CSR[N, L]` / `(*BiCSR).In() *CSR[N, L]`
 
@@ -399,6 +472,104 @@ The outbound (keyed on source) and inbound (keyed on target) adjacencies, sharin
 Consider an adjacency-list or map-of-slices for:
 - Frequently mutated graphs
 - Small graphs where construction overhead and immutability are not worth it
+
+## StringArena
+
+`StringArena` is a high-performance, chunk-based memory allocator optimized for allocating strings. It consolidates many small, transient allocations into large, contiguous blocks (chunks) and uses zero-copy string views, which dramatically reduces Garbage Collector (GC) pressure and CPU overhead in high-throughput workloads.
+
+### Features
+
+- **Chunk-based allocation**: Accumulates string copies in pre-allocated contiguous buffers, minimizing heap fragmentation
+- **Zero-allocation conversions**: Employs unsafe pointers (`unsafe.String`) to produce string headers referencing the arena memory directly, completely avoiding standard Go string heap allocations on allocate
+- **Automatic dynamic growth**: Allocates new chunks as memory demands increase, while keeping all previous string views completely valid
+- **Instant resets and reuse**: Fast reset operation that enables full chunk reuse across operations without reallocating underlying heap memory
+- **High performance**: Yields zero allocations and massive speedups for strings larger than 128 bytes in comparative benchmarks
+- **Statistics reporting**: Provides granular insights into total capacity, bytes used, and chunk counts
+
+### Design
+
+A `StringArena` pre-allocates an initial byte slice (chunk) of a given size. When a string or byte slice is allocated into the arena:
+1. It copies the source data into the current active chunk.
+2. It returns a string that directly points to this segment of the chunk using Go 1.20+ standard `unsafe.String` functionality.
+3. If the active chunk becomes full, the arena automatically allocates a new chunk (using the larger of the default chunk size or the size of the incoming string).
+4. When `Reset()` is called, the arena sets its indices back to zero, allowing previous chunks to be completely overwritten and reused without releasing or reallocating the underlying memory.
+
+### Usage
+
+```go
+package main
+
+import (
+	"fmt"
+	"github.com/schraf/collections"
+)
+
+func main() {
+	// Initialize an arena with a 16KB chunk size
+	arena := collections.NewStringArena(16384)
+
+	// Allocate transient strings or byte slices into the arena
+	s1 := arena.Alloc("hello")
+	s2 := arena.AllocBytes([]byte("world"))
+
+	fmt.Printf("%s %s\n", s1, s2) // Output: hello world
+
+	// Check stats
+	stats := arena.Stats()
+	fmt.Printf("Chunks: %d, Allocated: %d, Used: %d\n", stats.NumChunks, stats.TotalAllocated, stats.TotalUsed)
+
+	// Reset the arena for reuse (invalidates previously allocated strings)
+	arena.Reset()
+}
+```
+
+### API Reference
+
+#### `NewStringArena(chunkSize int) *StringArena`
+
+Creates a new string arena with the specified chunk size in bytes. If `chunkSize` is non-positive, it defaults to `16384` (16KB). If it is less than `1024`, it is enforced to a minimum of `1024` (1KB) to prevent small, inefficient chunks.
+
+#### `(*StringArena).Alloc(s string) string`
+
+Copies the content of the transient string `s` into the arena and returns a string view pointing directly to the arena's memory. If `s` is empty, it returns `""` without modifying the arena.
+
+#### `(*StringArena).AllocBytes(b []byte) string`
+
+Copies the content of the transient byte slice `b` into the arena and returns a string view pointing directly to the arena's memory. If `b` is empty, it returns `""` without modifying the arena.
+
+#### `(*StringArena).Reset()`
+
+Resets the arena's allocation index back to the beginning. All previously allocated chunks are preserved for reuse. Calling `Reset()` invalidates all previously allocated strings from this arena, and their memory might be overwritten during subsequent allocations.
+
+#### `(*StringArena).Stats() Stats`
+
+Returns a `Stats` struct with the following fields:
+- **TotalAllocated**: Total bytes of heap memory allocated across all chunks.
+- **TotalUsed**: Active bytes currently used by strings in the current allocation cycle.
+- **NumChunks**: The number of chunks allocated.
+
+### Performance Characteristics
+
+In typical workloads involving string parsing (such as JSON or CSV parsing):
+- **Allocate**: O(1) average case, with near-zero overhead consisting of a single memory copy of the string contents.
+- **Garbage Collection**: Reduces GC overhead to a single object (the arena itself) rather than millions of independent string allocations.
+- **Growth**: O(1) chunk allocation that doesn't copy previously allocated data.
+
+### Limitations
+
+- **Concurrent Safety**: `StringArena` is not safe for concurrent use by multiple goroutines. External synchronization must be provided if used across goroutines.
+- **Memory Lifetime**: Strings allocated from the arena remain valid until `Reset()` is called (provided the arena is not garbage collected). If individual strings need to live longer than others, a general arena may not be appropriate.
+
+### When to Use
+
+`StringArena` is ideal for:
+- High-performance parsers (JSON, CSV, protocols) where transient bytes are converted to long-lived strings
+- Compilers, interpreters, or key-value stores with intensive string-interning requirements
+- Batch-processing tasks where memory can be allocated, processed, and completely reset at the end of each batch
+
+Consider standard Go strings for:
+- Long-lived strings with individual, independent lifetimes
+- Scenarios where concurrent goroutines share the allocator without synchronization
 
 ## License
 
