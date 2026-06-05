@@ -400,6 +400,104 @@ Consider an adjacency-list or map-of-slices for:
 - Frequently mutated graphs
 - Small graphs where construction overhead and immutability are not worth it
 
+## StringArena
+
+`StringArena` is a high-performance, chunk-based memory allocator optimized for allocating strings. It consolidates many small, transient allocations into large, contiguous blocks (chunks) and uses zero-copy string views, which dramatically reduces Garbage Collector (GC) pressure and CPU overhead in high-throughput workloads.
+
+### Features
+
+- **Chunk-based allocation**: Accumulates string copies in pre-allocated contiguous buffers, minimizing heap fragmentation
+- **Zero-allocation conversions**: Employs unsafe pointers (`unsafe.String`) to produce string headers referencing the arena memory directly, completely avoiding standard Go string heap allocations on allocate
+- **Automatic dynamic growth**: Allocates new chunks as memory demands increase, while keeping all previous string views completely valid
+- **Instant resets and reuse**: Fast reset operation that enables full chunk reuse across operations without reallocating underlying heap memory
+- **High performance**: Yields zero allocations and massive speedups for strings larger than 128 bytes in comparative benchmarks
+- **Statistics reporting**: Provides granular insights into total capacity, bytes used, and chunk counts
+
+### Design
+
+A `StringArena` pre-allocates an initial byte slice (chunk) of a given size. When a string or byte slice is allocated into the arena:
+1. It copies the source data into the current active chunk.
+2. It returns a string that directly points to this segment of the chunk using Go 1.20+ standard `unsafe.String` functionality.
+3. If the active chunk becomes full, the arena automatically allocates a new chunk (using the larger of the default chunk size or the size of the incoming string).
+4. When `Reset()` is called, the arena sets its indices back to zero, allowing previous chunks to be completely overwritten and reused without releasing or reallocating the underlying memory.
+
+### Usage
+
+```go
+package main
+
+import (
+	"fmt"
+	"github.com/schraf/collections"
+)
+
+func main() {
+	// Initialize an arena with a 16KB chunk size
+	arena := collections.NewStringArena(16384)
+
+	// Allocate transient strings or byte slices into the arena
+	s1 := arena.Alloc("hello")
+	s2 := arena.AllocBytes([]byte("world"))
+
+	fmt.Printf("%s %s\n", s1, s2) // Output: hello world
+
+	// Check stats
+	stats := arena.Stats()
+	fmt.Printf("Chunks: %d, Allocated: %d, Used: %d\n", stats.NumChunks, stats.TotalAllocated, stats.TotalUsed)
+
+	// Reset the arena for reuse (invalidates previously allocated strings)
+	arena.Reset()
+}
+```
+
+### API Reference
+
+#### `NewStringArena(chunkSize int) *StringArena`
+
+Creates a new string arena with the specified chunk size in bytes. If `chunkSize` is non-positive, it defaults to `16384` (16KB). If it is less than `1024`, it is enforced to a minimum of `1024` (1KB) to prevent small, inefficient chunks.
+
+#### `(*StringArena).Alloc(s string) string`
+
+Copies the content of the transient string `s` into the arena and returns a string view pointing directly to the arena's memory. If `s` is empty, it returns `""` without modifying the arena.
+
+#### `(*StringArena).AllocBytes(b []byte) string`
+
+Copies the content of the transient byte slice `b` into the arena and returns a string view pointing directly to the arena's memory. If `b` is empty, it returns `""` without modifying the arena.
+
+#### `(*StringArena).Reset()`
+
+Resets the arena's allocation index back to the beginning. All previously allocated chunks are preserved for reuse. Calling `Reset()` invalidates all previously allocated strings from this arena, and their memory might be overwritten during subsequent allocations.
+
+#### `(*StringArena).Stats() Stats`
+
+Returns a `Stats` struct with the following fields:
+- **TotalAllocated**: Total bytes of heap memory allocated across all chunks.
+- **TotalUsed**: Active bytes currently used by strings in the current allocation cycle.
+- **NumChunks**: The number of chunks allocated.
+
+### Performance Characteristics
+
+In typical workloads involving string parsing (such as JSON or CSV parsing):
+- **Allocate**: O(1) average case, with near-zero overhead consisting of a single memory copy of the string contents.
+- **Garbage Collection**: Reduces GC overhead to a single object (the arena itself) rather than millions of independent string allocations.
+- **Growth**: O(1) chunk allocation that doesn't copy previously allocated data.
+
+### Limitations
+
+- **Concurrent Safety**: `StringArena` is not safe for concurrent use by multiple goroutines. External synchronization must be provided if used across goroutines.
+- **Memory Lifetime**: Strings allocated from the arena remain valid until `Reset()` is called (provided the arena is not garbage collected). If individual strings need to live longer than others, a general arena may not be appropriate.
+
+### When to Use
+
+`StringArena` is ideal for:
+- High-performance parsers (JSON, CSV, protocols) where transient bytes are converted to long-lived strings
+- Compilers, interpreters, or key-value stores with intensive string-interning requirements
+- Batch-processing tasks where memory can be allocated, processed, and completely reset at the end of each batch
+
+Consider standard Go strings for:
+- Long-lived strings with individual, independent lifetimes
+- Scenarios where concurrent goroutines share the allocator without synchronization
+
 ## License
 
 [See LICENSE file](LICENSE)
