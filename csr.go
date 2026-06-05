@@ -27,7 +27,7 @@ type CSR[N comparable, L comparable] struct {
 	neighbors []int32
 	labels    []uint8
 
-	denseToID []N
+	denseToId []N
 	idToDense map[N]int32
 
 	labelToCode map[L]uint8
@@ -39,7 +39,7 @@ type CSR[N comparable, L comparable] struct {
 const MaxCSRLabels = 256
 
 // NumNodes returns the number of nodes.
-func (c *CSR[N, L]) NumNodes() int { return len(c.denseToID) }
+func (c *CSR[N, L]) NumNodes() int { return len(c.denseToId) }
 
 // NumEdges returns the number of directed edges.
 func (c *CSR[N, L]) NumEdges() int { return len(c.neighbors) }
@@ -54,10 +54,10 @@ func (c *CSR[N, L]) Dense(id N) (dense int32, ok bool) {
 	return d, ok
 }
 
-// ID resolves a dense index back to its external node id. It panics if dense is
+// NodeId resolves a dense index back to its external node id. It panics if dense is
 // out of range; callers iterating known-valid indices need not check.
-func (c *CSR[N, L]) ID(dense int32) N {
-	return c.denseToID[dense]
+func (c *CSR[N, L]) NodeId(dense int32) N {
+	return c.denseToId[dense]
 }
 
 // LabelCode resolves an external label to its internal code. ok is false when
@@ -85,10 +85,23 @@ func (c *CSR[N, L]) Row(dense int32) (neighbors []int32, labels []uint8) {
 	return c.neighbors[start:end], c.labels[start:end]
 }
 
+// EdgeRange returns the half-open range [start, end) of flat edge positions for
+// a dense node. Every edge in the CSR has a stable flat position in [0, NumEdges);
+// the node's k-th neighbor is at flat position start+k. Callers that need a
+// per-edge payload (e.g. an external id) can keep their own parallel slice of
+// length NumEdges and index it by flat position, avoiding a separate map. The
+// same positions index the neighbors and labels arrays (see Row): for a node
+// with EdgeRange [start,end), Row()[k] corresponds to flat position start+k.
+func (c *CSR[N, L]) EdgeRange(dense int32) (start, end int32) {
+	return c.offsets[dense], c.offsets[dense+1]
+}
+
 // Neighbors returns a range-over-func iterator that yields each
 // (neighborDense, labelCode) edge out of the given dense node, stopping early
 // if the loop body breaks. This avoids allocating and lets callers filter by
-// label cheaply.
+// label cheaply. To recover the flat edge position of each yielded edge (e.g.
+// to index a per-edge payload), pair this with EdgeRange: the k-th yielded
+// edge is at flat position EdgeRange(dense).start + k.
 func (c *CSR[N, L]) Neighbors(dense int32) func(yield func(neighbor int32, label uint8) bool) {
 	return func(yield func(neighbor int32, label uint8) bool) {
 		start, end := c.offsets[dense], c.offsets[dense+1]
@@ -100,13 +113,26 @@ func (c *CSR[N, L]) Neighbors(dense int32) func(yield func(neighbor int32, label
 	}
 }
 
+// csrLayout holds the position-aligned arrays produced by fillCSR. perm[i] is
+// the flat CSR position assigned to the edge that was accumulated at index i;
+// callers can use it to reorder their own per-edge payload slices into CSR
+// position order without storing a map.
+type csrLayout struct {
+	offsets   []int32
+	neighbors []int32
+	labels    []uint8
+	perm      []int32
+}
+
 // fillCSR builds CSR offset/neighbor/label arrays keyed on the keys slice
 // (dense source indices for the direction being built), with vals as the
 // neighbor dense indices and labelCodes the parallel label codes. It is
 // direction-, label-, and identity-agnostic; the caller attaches the shared
-// identity and label tables to the resulting CSR.
-func fillCSR(numNodes int, keys, vals []int32, labelCodes []uint8) (offsets, neighbors []int32, labels []uint8) {
-	offsets = make([]int32, numNodes+1)
+// identity and label tables to the resulting CSR. The returned layout also
+// carries the accumulation→position permutation so callers can place per-edge
+// payloads (see PermuteCSRData).
+func fillCSR(numNodes int, keys, vals []int32, labelCodes []uint8) csrLayout {
+	offsets := make([]int32, numNodes+1)
 	for _, k := range keys {
 		offsets[k+1]++
 	}
@@ -114,8 +140,9 @@ func fillCSR(numNodes int, keys, vals []int32, labelCodes []uint8) (offsets, nei
 		offsets[i+1] += offsets[i]
 	}
 
-	neighbors = make([]int32, len(keys))
-	labels = make([]uint8, len(keys))
+	neighbors := make([]int32, len(keys))
+	labels := make([]uint8, len(keys))
+	perm := make([]int32, len(keys))
 
 	cursor := make([]int32, numNodes)
 	copy(cursor, offsets[:numNodes])
@@ -125,8 +152,21 @@ func fillCSR(numNodes int, keys, vals []int32, labelCodes []uint8) (offsets, nei
 		pos := cursor[k]
 		neighbors[pos] = vals[i]
 		labels[pos] = labelCodes[i]
+		perm[i] = pos
 		cursor[k]++
 	}
 
-	return offsets, neighbors, labels
+	return csrLayout{offsets: offsets, neighbors: neighbors, labels: labels, perm: perm}
+}
+
+// PermuteCSRData reorders a per-edge payload slice (in edge-accumulation order)
+// into CSR flat-position order, using a permutation returned alongside a CSR by
+// the *WithData builders. The result is indexed by flat edge position, parallel
+// to the CSR's neighbors/labels, so it can be looked up via EdgeRange/Edges.
+func PermuteCSRData[D any](data []D, perm []int32) []D {
+	out := make([]D, len(data))
+	for i, pos := range perm {
+		out[pos] = data[i]
+	}
+	return out
 }

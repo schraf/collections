@@ -11,7 +11,7 @@ import (
 func biIDs(c *CSR[int64, string], dense []int32) []int64 {
 	out := make([]int64, 0, len(dense))
 	for _, d := range dense {
-		out = append(out, c.ID(d))
+		out = append(out, c.NodeId(d))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
