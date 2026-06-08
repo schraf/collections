@@ -4,86 +4,111 @@ import (
 	"sync"
 )
 
+type DenseId = uint32
+
 // ╭────────────────────────────────────────────────────────────────────╮
 // │ Directed Graph                                                     │
 // ╰────────────────────────────────────────────────────────────────────╯
 
-type DirectedGraph struct {
-	offsets []uint32
-	edges   []uint32
-	labels  []uint8
+type DirectedGraph[OffsetType Unsigned, EdgeType any] struct {
+	offsets []OffsetType
+	edges   []DenseId
+	labels  []EdgeType
 }
 
-func NewDirectedGraph(offsets []uint32, edges []uint32, labels []uint8) *DirectedGraph {
-	return &DirectedGraph{
+func NewDirectedGraph[OffsetType Unsigned, EdgeType any](offsets []OffsetType, edges []DenseId, labels []EdgeType) *DirectedGraph[OffsetType, EdgeType] {
+	return &DirectedGraph[OffsetType, EdgeType]{
 		offsets: offsets,
 		edges:   edges,
 		labels:  labels,
 	}
 }
 
-func (g *DirectedGraph) Neighbors(nodeId uint32) ([]uint32, []uint8) {
-	if int(nodeId) >= len(g.offsets)-1 {
+func (g *DirectedGraph[OffsetType, EdgeType]) Neighbors(denseId DenseId) ([]DenseId, []EdgeType) {
+	if int(denseId) >= len(g.offsets)-1 {
 		return nil, nil
 	}
 
-	start := g.offsets[nodeId]
-	end := g.offsets[nodeId+1]
+	start := g.offsets[denseId]
+	end := g.offsets[denseId+1]
 
-	return g.edges[start:end], g.labels[start:end]
+	neighbors := g.edges[start:end]
+
+	var labels []EdgeType
+
+	if g.labels != nil {
+		labels = g.labels[start:end]
+	}
+
+	return neighbors, labels
 }
 
 // ╭────────────────────────────────────────────────────────────────────╮
 // │ Mutable Directed Graph                                             │
 // ╰────────────────────────────────────────────────────────────────────╯
 
-type MutableDirectedGraph struct {
-	DirectedGraph
+type MutableDirectedGraph[OffsetType Unsigned, EdgeType any] struct {
+	DirectedGraph[OffsetType, EdgeType]
 
 	lock         sync.RWMutex
-	addedEdges   map[uint32][]uint32
-	addedLabels  map[uint32][]uint8
-	removedEdges map[uint32]map[uint32]struct{}
+	addedEdges   map[DenseId][]DenseId
+	addedLabels  map[DenseId][]EdgeType
+	removedEdges map[DenseId]map[DenseId]struct{}
 }
 
-func NewMutableDirectedGraph(base DirectedGraph) *MutableDirectedGraph {
-	return &MutableDirectedGraph{
+func NewMutableDirectedGraph[OffsetType Unsigned, EdgeType any](base DirectedGraph[OffsetType, EdgeType]) *MutableDirectedGraph[OffsetType, EdgeType] {
+	return &MutableDirectedGraph[OffsetType, EdgeType]{
 		DirectedGraph: base,
-		addedEdges:    make(map[uint32][]uint32),
-		addedLabels:   make(map[uint32][]uint8),
-		removedEdges:  make(map[uint32]map[uint32]struct{}),
+		addedEdges:    make(map[DenseId][]DenseId),
+		addedLabels:   make(map[DenseId][]EdgeType),
+		removedEdges:  make(map[DenseId]map[DenseId]struct{}),
 	}
 }
 
-func (g *MutableDirectedGraph) AddEdge(a uint32, b uint32, label uint8) {
+func (g *MutableDirectedGraph[OffsetType, EdgeType]) AddEdge(a DenseId, b DenseId) {
 	g.lock.Lock()
 	defer g.lock.Unlock()
 
 	g.addedEdges[a] = append(g.addedEdges[a], b)
-	g.addedLabels[a] = append(g.addedLabels[a], label)
+
+	if g.DirectedGraph.labels != nil {
+		var label EdgeType
+		g.addedLabels[a] = append(g.addedLabels[a], label)
+	}
 }
 
-func (g *MutableDirectedGraph) RemoveEdge(a uint32, b uint32) {
+func (g *MutableDirectedGraph[OffsetType, EdgeType]) AddEdgeWithLabel(a DenseId, b DenseId, label EdgeType) {
+	g.lock.Lock()
+	defer g.lock.Unlock()
+
+	g.addedEdges[a] = append(g.addedEdges[a], b)
+
+	if g.DirectedGraph.labels != nil {
+		g.addedLabels[a] = append(g.addedLabels[a], label)
+	}
+}
+
+func (g *MutableDirectedGraph[OffsetType, EdgeType]) RemoveEdge(a DenseId, b DenseId) {
 	g.lock.Lock()
 	defer g.lock.Unlock()
 
 	if g.removedEdges[a] == nil {
-		g.removedEdges[a] = make(map[uint32]struct{})
+		g.removedEdges[a] = make(map[DenseId]struct{})
 	}
 
 	g.removedEdges[a][b] = struct{}{}
 }
 
-func (g *MutableDirectedGraph) Neighbors(nodeId uint32) ([]uint32, []uint8) {
-	var neighbors []uint32
-	var labels []uint8
+func (g *MutableDirectedGraph[OffsetType, EdgeType]) Neighbors(denseId DenseId) ([]DenseId, []EdgeType) {
+	var neighbors []DenseId
+	var labels []EdgeType
 
-	baseNeighbors, baseLabels := g.DirectedGraph.Neighbors(nodeId)
+	baseNeighbors, baseLabels := g.DirectedGraph.Neighbors(denseId)
 
 	g.lock.RLock()
 	defer g.lock.RUnlock()
 
-	tombstones, hasDeletes := g.removedEdges[nodeId]
+	tombstones, hasDeletes := g.removedEdges[denseId]
 
 	if hasDeletes {
 		for i := 0; i < len(baseNeighbors); i++ {
@@ -91,20 +116,28 @@ func (g *MutableDirectedGraph) Neighbors(nodeId uint32) ([]uint32, []uint8) {
 
 			if _, deleted := tombstones[neighbor]; !deleted {
 				neighbors = append(neighbors, neighbor)
-				labels = append(labels, baseLabels[i])
+
+				if baseLabels != nil {
+					labels = append(labels, baseLabels[i])
+				}
 			}
 		}
 	} else if len(baseNeighbors) > 0 {
 		neighbors = append(neighbors, baseNeighbors...)
-		labels = append(labels, baseLabels...)
+
+		if baseLabels != nil {
+			labels = append(labels, baseLabels...)
+		}
 	}
 
-	added, hasAdded := g.addedEdges[nodeId]
+	added, hasAdded := g.addedEdges[denseId]
 	if hasAdded {
-		addedLabels := g.addedLabels[nodeId]
-
 		neighbors = append(neighbors, added...)
-		labels = append(labels, addedLabels...)
+
+		if g.DirectedGraph.labels != nil {
+			addedLabels := g.addedLabels[denseId]
+			labels = append(labels, addedLabels...)
+		}
 	}
 
 	return neighbors, labels
@@ -114,26 +147,31 @@ func (g *MutableDirectedGraph) Neighbors(nodeId uint32) ([]uint32, []uint8) {
 // │ Bidirected Graph                                                   │
 // ╰────────────────────────────────────────────────────────────────────╯
 
-type BidirectedGraph struct {
-	Outbound *DirectedGraph
-	Inbound  *DirectedGraph
+type BidirectedGraph[OffsetType Unsigned, EdgeType any] struct {
+	Outbound *DirectedGraph[OffsetType, EdgeType]
+	Inbound  *DirectedGraph[OffsetType, EdgeType]
 }
 
 // ╭────────────────────────────────────────────────────────────────────╮
 // │ MutableBidirected Graph                                            │
 // ╰────────────────────────────────────────────────────────────────────╯
 
-type MutableBidirectedGraph struct {
-	Outbound *MutableDirectedGraph
-	Inbound  *MutableDirectedGraph
+type MutableBidirectedGraph[OffsetType Unsigned, EdgeType any] struct {
+	Outbound *MutableDirectedGraph[OffsetType, EdgeType]
+	Inbound  *MutableDirectedGraph[OffsetType, EdgeType]
 }
 
-func (m *MutableBidirectedGraph) AddEdge(a uint32, b uint32, label uint8) {
-	m.Outbound.AddEdge(a, b, label)
-	m.Inbound.AddEdge(b, a, label)
+func (m *MutableBidirectedGraph[OffsetType, EdgeType]) AddEdge(a DenseId, b DenseId) {
+	m.Outbound.AddEdge(a, b)
+	m.Inbound.AddEdge(b, a)
 }
 
-func (m *MutableBidirectedGraph) RemoveEdge(a uint32, b uint32) {
+func (m *MutableBidirectedGraph[OffsetType, EdgeType]) AddEdgeWithLabel(a DenseId, b DenseId, label EdgeType) {
+	m.Outbound.AddEdgeWithLabel(a, b, label)
+	m.Inbound.AddEdgeWithLabel(b, a, label)
+}
+
+func (m *MutableBidirectedGraph[OffsetType, EdgeType]) RemoveEdge(a DenseId, b DenseId) {
 	m.Outbound.RemoveEdge(a, b)
 	m.Inbound.RemoveEdge(b, a)
 }
@@ -142,84 +180,125 @@ func (m *MutableBidirectedGraph) RemoveEdge(a uint32, b uint32) {
 // │ Graph Builder                                                      │
 // ╰────────────────────────────────────────────────────────────────────╯
 
-type GraphBuilder struct {
-	nodeCount      uint32
-	inbound        map[uint32][]uint32
-	outbound       map[uint32][]uint32
-	inboundLabels  map[uint32][]uint8
-	outboundLabels map[uint32][]uint8
+type GraphBuilder[OffsetType Unsigned, EdgeType any] struct {
+	nodeCount      DenseId
+	inbound        map[DenseId][]DenseId
+	outbound       map[DenseId][]DenseId
+	inboundLabels  map[DenseId][]EdgeType
+	outboundLabels map[DenseId][]EdgeType
 }
 
-func NewGraphBuilder(nodeCount uint32) *GraphBuilder {
-	return &GraphBuilder{
-		nodeCount:      nodeCount,
-		inbound:        make(map[uint32][]uint32, nodeCount),
-		outbound:       make(map[uint32][]uint32, nodeCount),
-		inboundLabels:  make(map[uint32][]uint8, nodeCount),
-		outboundLabels: make(map[uint32][]uint8, nodeCount),
+func NewGraphBuilder[OffsetType Unsigned, EdgeType any](nodeCount DenseId, withLabels bool) *GraphBuilder[OffsetType, EdgeType] {
+	builder := &GraphBuilder[OffsetType, EdgeType]{
+		nodeCount: nodeCount,
+		inbound:   make(map[DenseId][]DenseId, nodeCount),
+		outbound:  make(map[DenseId][]DenseId, nodeCount),
 	}
+
+	if withLabels {
+		builder.inboundLabels = make(map[DenseId][]EdgeType, nodeCount)
+		builder.outboundLabels = make(map[DenseId][]EdgeType, nodeCount)
+	}
+
+	return builder
 }
 
-func (b *GraphBuilder) AddEdge(from uint32, to uint32, label uint8) {
+func (b *GraphBuilder[OffsetType, EdgeType]) AddEdgeWithLabel(from DenseId, to DenseId, label EdgeType) {
 	if b.outbound[from] == nil {
-		b.outbound[from] = []uint32{}
-		b.outboundLabels[from] = []uint8{}
+		b.outbound[from] = []DenseId{}
+		b.outboundLabels[from] = []EdgeType{}
 	}
 
 	b.outbound[from] = append(b.outbound[from], to)
 	b.outboundLabels[from] = append(b.outboundLabels[from], label)
 
 	if b.inbound[to] == nil {
-		b.inbound[to] = []uint32{}
-		b.inboundLabels[to] = []uint8{}
+		b.inbound[to] = []DenseId{}
+		b.inboundLabels[to] = []EdgeType{}
 	}
 
 	b.inbound[to] = append(b.inbound[to], from)
 	b.inboundLabels[to] = append(b.inboundLabels[to], label)
 }
 
-func (b *GraphBuilder) BuildInboundGraph() *DirectedGraph {
-	offsets := make([]uint32, b.nodeCount+1)
+func (b *GraphBuilder[OffsetType, EdgeType]) AddEdge(from DenseId, to DenseId) {
+	var label EdgeType
 
-	var edges []uint32
-	var labels []uint8
-	var index uint32
+	if b.outbound[from] == nil {
+		b.outbound[from] = []DenseId{}
 
-	for index = 0; index < b.nodeCount; index++ {
-		offsets[index] = uint32(len(edges))
-
-		if neighbors, ok := b.inbound[index]; ok {
-			neighborLabels := b.inboundLabels[index]
-
-			edges = append(edges, neighbors...)
-			labels = append(labels, neighborLabels...)
+		if b.outboundLabels != nil {
+			b.outboundLabels[from] = []EdgeType{}
 		}
 	}
 
-	offsets[b.nodeCount] = uint32(len(edges))
+	b.outbound[from] = append(b.outbound[from], to)
+
+	if b.outboundLabels != nil {
+		b.outboundLabels[from] = append(b.outboundLabels[from], label)
+	}
+
+	if b.inbound[to] == nil {
+		b.inbound[to] = []DenseId{}
+
+		if b.inboundLabels != nil {
+			b.inboundLabels[to] = []EdgeType{}
+		}
+	}
+
+	b.inbound[to] = append(b.inbound[to], from)
+
+	if b.inboundLabels != nil {
+		b.inboundLabels[to] = append(b.inboundLabels[to], label)
+	}
+}
+
+func (b *GraphBuilder[OffsetType, EdgeType]) BuildInboundGraph() *DirectedGraph[OffsetType, EdgeType] {
+	offsets := make([]OffsetType, b.nodeCount+1)
+
+	var edges []DenseId
+	var labels []EdgeType
+	var index DenseId
+
+	for index = DenseId(0); index < b.nodeCount; index++ {
+		offsets[index] = OffsetType(len(edges))
+
+		if neighbors, ok := b.inbound[index]; ok {
+			edges = append(edges, neighbors...)
+
+			if b.inboundLabels != nil {
+				neighborLabels := b.inboundLabels[index]
+				labels = append(labels, neighborLabels...)
+			}
+		}
+	}
+
+	offsets[b.nodeCount] = OffsetType(len(edges))
 
 	return NewDirectedGraph(offsets, edges, labels)
 }
 
-func (b *GraphBuilder) BuildOutboundGraph() *DirectedGraph {
-	offsets := make([]uint32, b.nodeCount+1)
+func (b *GraphBuilder[OffsetType, EdgeType]) BuildOutboundGraph() *DirectedGraph[OffsetType, EdgeType] {
+	offsets := make([]OffsetType, b.nodeCount+1)
 
-	var edges []uint32
-	var labels []uint8
-	var index uint32
+	var edges []DenseId
+	var labels []EdgeType
+	var index DenseId
 
-	for index = 0; index < b.nodeCount; index++ {
-		offsets[index] = uint32(len(edges))
+	for index = DenseId(0); index < b.nodeCount; index++ {
+		offsets[index] = OffsetType(len(edges))
 
 		if neighbors, ok := b.outbound[index]; ok {
-			neighborLabels := b.outboundLabels[index]
-
 			edges = append(edges, neighbors...)
-			labels = append(labels, neighborLabels...)
+
+			if b.outboundLabels != nil {
+				neighborLabels := b.outboundLabels[index]
+				labels = append(labels, neighborLabels...)
+			}
 		}
 	}
 
-	offsets[b.nodeCount] = uint32(len(edges))
+	offsets[b.nodeCount] = OffsetType(len(edges))
 
 	return NewDirectedGraph(offsets, edges, labels)
 }
