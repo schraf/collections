@@ -262,42 +262,27 @@ Consider the standard Go `map` for:
 - String keys without conversion
 - Simpler API needs
 
-## CSR
+## Directed Graph
 
-`CSR` is a compact, immutable adjacency structure in compressed-sparse-row form, designed to hold the topology of very large directed graphs (tens of millions of nodes, hundreds of millions of edges) resident in memory at minimal cost.
+The `collections` package provides memory-efficient, dense directed and bidirected graph implementations.
 
 ### Features
 
-- **Compressed-sparse-row layout**: edges are stored as three parallel arrays (`offsets`, `neighbors`, `labels`) over dense node indices, with no per-node or per-edge pointers — cache-friendly and GC-light
-- **Generic**: parameterized over the external node identifier `N` and edge label `L` (both `comparable`)
-- **Dictionary-encoded labels**: each distinct edge label is interned to a one-byte code, so labels cost a single byte per edge (up to `MaxCSRLabels` = 256 distinct labels)
-- **Immutable after build**: a built `CSR` is safe for concurrent reads; reflect mutations by building a new one and swapping it in
-- **Builder-based construction**: accumulate edges via a builder that assigns dense indices lazily, then `Build()` into the final compact form
-- **Bidirectional view**: `BiCSR` holds outbound and inbound adjacencies over a shared dense-index space, the typical shape for graph traversal
-- **Allocation-free iteration**: `Neighbors` returns a range-over-func iterator yielding `(neighborDense, labelCode)` pairs
-- **Per-edge payload support**: attach arbitrary per-edge payloads (such as edge IDs, weights, or attributes) without storing them in a map or adding a payload type parameter, by indexing simple parallel slices with stable flat edge positions using `EdgeRange` and `BuildBiCSRWithData`
+- **Dense Node Indices**: Nodes are represented as dense `uint32` indices for cache-friendly memory access patterns.
+- **Immutable and Mutable Variants**: Choose between read-only, high-performance graph structures (`DirectedGraph`) or mutable versions that support edge additions and deletions (`MutableDirectedGraph`).
+- **Bidirectional Support**: Immutable and mutable bidirected graphs that maintain both outbound and inbound adjacency lists.
+- **Edge Labels**: Every edge carries a `uint8` label, useful for typing relationships or associating metadata.
+- **Builder-based Construction**: Accumulate edges using `GraphBuilder` and efficiently construct immutable `DirectedGraph` representations.
 
 ### Design
 
-A directed graph is stored over dense node indices `[0, N)`:
+The base `DirectedGraph` is immutable and stores adjacencies using parallel slices: `offsets`, `edges`, and `labels`. This guarantees optimal memory locality and zero garbage collection overhead per edge.
 
-```
-offsets   len N+1   offsets[i]..offsets[i+1] is node i's slice of edges
-neighbors len E     destination dense index of each edge
-labels    len E     dictionary-encoded edge label of each edge
-```
-
-External node ids are mapped to dense indices via an internal map, with a reverse slice (`denseToId`) for hydrating results. Edge labels are interned to `uint8` codes. A node's outgoing edges are the contiguous range `neighbors[offsets[i]:offsets[i+1]]` with parallel `labels`.
-
-`BiCSR` builds two such structures from one edge stream so that a given external id resolves to the same dense index in both the outbound and inbound directions, allowing a traversal to carry dense indices across direction changes without re-resolving.
-
-#### Edge Payload Mapping
-
-Because every edge has a stable flat position in `[0, E)` within the CSR's contiguous arrays, you can associate arbitrary edge attributes (e.g. edge IDs, weights, or timestamps) with edges without storing them in maps or adding generic payload type parameters. You simply maintain a parallel slice of length `E` containing your data, and index into it using the flat positions returned by `EdgeRange(dense)`.
-
-For bidirectional graphs, since the outbound and inbound edges are sorted differently, a builder-order payload slice must be permuted separately for each direction. The `BuildBiCSRWithData` helper automates this process, returning a built `BiCSR` alongside outbound-aligned and inbound-aligned payload slices.
+The `MutableDirectedGraph` wraps an immutable `DirectedGraph` and uses internal maps (`addedEdges`, `removedEdges`) to track additions and deletions. It combines these modifications on-the-fly during neighbor traversal, enabling fast edge mutations without rebuilding the underlying arrays.
 
 ### Usage
+
+#### Building an Immutable Graph
 
 ```go
 package main
@@ -309,38 +294,26 @@ import (
 )
 
 func main() {
-	// Build a bidirectional graph: 1 -> 2 -> 3, plus 1 -> 3.
-	b := collections.NewBiCSRBuilder[int64, string](0, 0)
-	b.AddEdge(1, 2, "depends_on")
-	b.AddEdge(2, 3, "depends_on")
-	b.AddEdge(1, 3, "built_from")
+	nodeCount := uint32(5)
+	builder := collections.NewGraphBuilder(nodeCount)
 
-	g, err := b.Build()
-	if err != nil {
-		panic(err)
-	}
+	// Add edges: From, To, Label
+	builder.AddEdge(0, 1, 10)
+	builder.AddEdge(0, 2, 20)
+	builder.AddEdge(1, 3, 30)
 
-	// Traverse outbound neighbors of node 1, filtering by label.
-	start, ok := g.Dense(1)
-	if !ok {
-		panic("node 1 missing")
-	}
+	// Build the outbound directed graph
+	graph := builder.BuildOutboundGraph()
 
-	for nb, label := range g.Out().Neighbors(start) {
-		fmt.Printf("1 -%s-> %d\n", g.Out().Label(label), g.Out().NodeId(nb))
-	}
-
-	// Inbound neighbors of node 3 (who points at it).
-	d3, _ := g.In().Dense(3)
-	for nb := range g.In().Neighbors(d3) {
-		fmt.Printf("%d -> 3\n", g.In().NodeId(nb))
+	// Traverse neighbors of node 0
+	neighbors, labels := graph.Neighbors(0)
+	for i, neighbor := range neighbors {
+		fmt.Printf("0 -> %d (Label: %d)\n", neighbor, labels[i])
 	}
 }
 ```
 
-### Bidirectional Graph with Edge Payloads
-
-If your edges have associated attributes (like unique edge IDs, weights, or timestamps), you can use `BuildBiCSRWithData` to automatically align those attributes into outbound and inbound slices matching the flat edge indices of each direction:
+#### Using Mutable Graphs
 
 ```go
 package main
@@ -352,126 +325,82 @@ import (
 )
 
 func main() {
-	b := collections.NewBiCSRBuilder[int64, string](0, 0)
+	nodeCount := uint32(5)
+	builder := collections.NewGraphBuilder(nodeCount)
+	builder.AddEdge(0, 1, 10)
 	
-	// Add edges in sequence
-	b.AddEdge(1, 2, "depends_on") // Index 0
-	b.AddEdge(2, 3, "depends_on") // Index 1
-	b.AddEdge(1, 3, "built_from") // Index 2
+	baseGraph := builder.BuildOutboundGraph()
 
-	// Payloads parallel to the AddEdge calls
-	edgeIDs := []int64{100, 101, 102}
+	// Create a mutable wrapper around the immutable base graph
+	mutableGraph := collections.NewMutableDirectedGraph(*baseGraph)
 
-	// Build the graph and reorder the edge payload slice for both directions
-	g, outIDs, inIDs, err := collections.BuildBiCSRWithData(b, edgeIDs)
-	if err != nil {
-		panic(err)
-	}
+	// Add new edges
+	mutableGraph.AddEdge(0, 2, 20)
 
-	// Traverse outbound neighbors of node 1 with edge payloads
-	d1, _ := g.Dense(1)
-	start, _ := g.Out().EdgeRange(d1)
-	
-	k := int32(0)
-	for nb, label := range g.Out().Neighbors(d1) {
-		edgeID := outIDs[start+k]
-		fmt.Printf("1 -[ID:%d, Label:%s]-> %d\n", edgeID, g.Out().Label(label), g.Out().NodeId(nb))
-		k++
-	}
+	// Remove existing edges
+	mutableGraph.RemoveEdge(0, 1)
 
-	// Traverse inbound neighbors of node 3 with edge payloads
-	d3, _ := g.Dense(3)
-	inStart, _ := g.In().EdgeRange(d3)
-	
-	inK := int32(0)
-	for nb := range g.In().Neighbors(d3) {
-		edgeID := inIDs[inStart+inK]
-		fmt.Printf("%d -[ID:%d]-> 3\n", g.In().NodeId(nb), edgeID)
-		inK++
+	// Traversal will now reflect added and removed edges
+	neighbors, labels := mutableGraph.Neighbors(0)
+	for i, neighbor := range neighbors {
+		fmt.Printf("0 -> %d (Label: %d)\n", neighbor, labels[i])
 	}
 }
 ```
 
 ### API Reference
 
-#### `NewCSRBuilder[N, L comparable](nodeHint, edgeHint int) *CSRBuilder[N, L]`
+#### `NewGraphBuilder(nodeCount uint32) *GraphBuilder`
 
-Creates a single-direction builder. The hints pre-size internal buffers (0 is fine).
+Creates a new graph builder pre-sized for the specified number of nodes.
 
-#### `(*CSRBuilder).AddNode(id N) int32`
+#### `(*GraphBuilder).AddEdge(from uint32, to uint32, label uint8)`
 
-Ensures `id` has a dense index (for registering isolated nodes), returning it.
+Records a directed edge from the source to the destination node with a byte label.
 
-#### `(*CSRBuilder).AddEdge(src, dst N, label L)`
+#### `(*GraphBuilder).BuildOutboundGraph() *DirectedGraph`
 
-Records a directed edge. Endpoints are registered if new. Errors (e.g. exceeding `MaxCSRLabels`) are recorded and surfaced by `Build`.
+Constructs an immutable directed graph keyed by source nodes (outbound edges).
 
-#### `(*CSRBuilder).Build() (*CSR[N, L], error)`
+#### `(*GraphBuilder).BuildInboundGraph() *DirectedGraph`
 
-Produces the immutable `CSR` and releases the builder's accumulation buffers. The builder must not be reused afterward.
+Constructs an immutable directed graph keyed by destination nodes (inbound edges).
 
-#### `NewBiCSRBuilder[N, L comparable](nodeHint, edgeHint int) *BiCSRBuilder[N, L]`
+#### `(*DirectedGraph).Neighbors(nodeId uint32) ([]uint32, []uint8)`
 
-Creates a bidirectional builder with the same `AddNode`/`AddEdge`/`Build` API, producing a `BiCSR`.
+Returns the destination node IDs and their corresponding labels for the given node. The returned slices are direct references to the graph's internal arrays and should not be modified.
 
-#### `BuildBiCSRWithData[N, L comparable, D any](b *BiCSRBuilder[N, L], data []D) (bi *BiCSR[N, L], outData, inData []D, err error)`
+#### `NewMutableDirectedGraph(base DirectedGraph) *MutableDirectedGraph`
 
-Builds a `BiCSR` and reorders a caller-supplied per-edge payload slice `data` (which must be in the same order as the builder's `AddEdge` calls) into both the outbound and inbound CSR flat-position orders. The returned `outData` aligns with the outbound CSR's flat positions (retrieved via `EdgeRange`), and `inData` aligns with the inbound CSR's. This consumes the builder like `Build()`.
+Creates a mutable graph structure that wraps an existing immutable graph.
 
-#### `PermuteCSRData[D any](data []D, perm []int32) []D`
+#### `(*MutableDirectedGraph).AddEdge(a uint32, b uint32, label uint8)`
 
-Reorders a per-edge payload slice (in edge-accumulation/`AddEdge` order) into a CSR's flat-position order using the permutation indices returned by the internal builder layout.
+Adds a new edge to the mutable graph. This operation is thread-safe using a read-write lock.
 
-#### `(*CSR).Dense(id N) (int32, bool)` / `(*CSR).NodeId(dense int32) N`
+#### `(*MutableDirectedGraph).RemoveEdge(a uint32, b uint32)`
 
-Convert between external node ids and dense indices.
+Removes an edge from the mutable graph. This operation is thread-safe.
 
-#### `(*CSR).LabelCode(label L) (uint8, bool)` / `(*CSR).Label(code uint8) L`
+#### `(*MutableDirectedGraph).Neighbors(nodeId uint32) ([]uint32, []uint8)`
 
-Convert between external labels and internal codes.
+Returns the neighbors, reflecting both edges from the base graph and any applied additions or removals.
 
-#### `(*CSR).Degree(dense int32) int`
+#### `BidirectedGraph` & `MutableBidirectedGraph`
 
-Number of outgoing edges of a dense node.
-
-#### `(*CSR).Row(dense int32) (neighbors []int32, labels []uint8)`
-
-Returns the neighbor and label slices for a node. The slices alias internal arrays and must not be modified.
-
-#### `(*CSR).Neighbors(dense int32) func(yield func(neighbor int32, label uint8) bool)`
-
-Returns a range-over-func iterator over a node's edges, allocation-free and break-able.
-
-#### `(*CSR).EdgeRange(dense int32) (start, end int32)`
-
-Returns the stable half-open range `[start, end)` of flat edge positions for a dense node. The node's `k`-th edge is at flat position `start + k`. These positions can be used to index parallel user-allocated payload slices (like edge weights or IDs).
-
-#### `(*BiCSR).Out() *CSR[N, L]` / `(*BiCSR).In() *CSR[N, L]`
-
-The outbound (keyed on source) and inbound (keyed on target) adjacencies, sharing a dense-index space.
+Containers for paired outbound and inbound graphs, offering `AddEdge` and `RemoveEdge` that automatically update both directions simultaneously.
 
 ### Performance Characteristics
 
-- **Neighbor lookup**: O(degree), sequential scan of contiguous arrays with excellent cache locality
-- **Build**: O(V + E) via degree counting and a prefix-sum fill, single allocation per array
-- **Memory**: roughly `(N+1 + E)·4` bytes for offsets+neighbors plus `E` bytes for labels, per direction, plus the id↔dense maps
-
-### Limitations
-
-- Immutable after `Build`; mutations require rebuilding
-- At most `MaxCSRLabels` (256) distinct edge labels, due to one-byte label encoding
-- Dense indices are `int32`, bounding a single CSR to ~2.1 billion nodes/edges
+- **Neighbor lookup (Immutable)**: O(1) array slice access, excellent cache locality.
+- **Neighbor lookup (Mutable)**: Overheads associated with reading internal hash maps and tombstone filtering, plus a read lock.
+- **Build**: Fast population of continuous memory buffers.
 
 ### When to Use
 
-`CSR` is ideal for:
-- Holding a large, read-mostly graph topology resident in memory
-- Repeated traversals (BFS/DFS) where per-hop neighbor lookups must be fast
-- Workloads where graph structure changes infrequently (rebuild-and-swap)
-
-Consider an adjacency-list or map-of-slices for:
-- Frequently mutated graphs
-- Small graphs where construction overhead and immutability are not worth it
+- When you have graphs with dense integer node IDs.
+- When you need high-performance traversal with minimal memory overhead.
+- When you need to incrementally mutate a large base graph (using `MutableDirectedGraph`).
 
 ## StringArena
 
