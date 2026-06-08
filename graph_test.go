@@ -19,16 +19,16 @@ func TestGraph(t *testing.T) {
 	const t1 uint8 = 1
 	const t2 uint8 = 2
 
-	b := NewGraphBuilder(5)
+	b := NewGraphBuilder[uint64, uint8](5, true)
 
-	b.AddEdge(0, 1, t0)
-	b.AddEdge(0, 3, t1)
-	b.AddEdge(1, 2, t2)
-	b.AddEdge(2, 1, t0)
-	b.AddEdge(3, 4, t1)
-	b.AddEdge(4, 1, t2)
+	b.AddEdgeWithLabel(0, 1, t0)
+	b.AddEdgeWithLabel(0, 3, t1)
+	b.AddEdgeWithLabel(1, 2, t2)
+	b.AddEdgeWithLabel(2, 1, t0)
+	b.AddEdgeWithLabel(3, 4, t1)
+	b.AddEdgeWithLabel(4, 1, t2)
 
-	graph := MutableBidirectedGraph{
+	graph := MutableBidirectedGraph[uint64, uint8]{
 		Inbound:  NewMutableDirectedGraph(*b.BuildInboundGraph()),
 		Outbound: NewMutableDirectedGraph(*b.BuildOutboundGraph()),
 	}
@@ -97,7 +97,7 @@ func TestGraph(t *testing.T) {
 	// │ MutateGraph                                                        │
 	// ╰────────────────────────────────────────────────────────────────────╯
 
-	graph.AddEdge(1, 3, t1)
+	graph.AddEdgeWithLabel(1, 3, t1)
 	graph.RemoveEdge(0, 3)
 
 	// node 0
