@@ -262,6 +262,76 @@ Consider the standard Go `map` for:
 - String keys without conversion
 - Simpler API needs
 
+## StaticFlatMap
+
+`StaticFlatMap` is a read-only map for integer keys, backed by two parallel slices: sorted keys and their corresponding values. It is built once from a standard Go `map` and optimized for cache-friendly lookups via binary search.
+
+### Features
+
+- **Immutable after construction**: No insert, update, or delete operations
+- **Integer keys only**: Works with any signed or unsigned integer type
+- **Sorted flat storage**: Keys are sorted at build time for O(log n) binary search lookups
+- **Memory efficient**: Two contiguous slices with no hash table overhead
+
+### Usage
+
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/schraf/collections"
+)
+
+func main() {
+    data := map[uint64]uint32{
+        42:          33,
+        100:         85,
+        500_000_000: 13,
+    }
+
+    m := collections.NewStaticFlatMap(data)
+
+    value, found := m.Get(42)
+    if found {
+        fmt.Println(value) // 33
+    }
+
+    _, found = m.Get(999)
+    if !found {
+        fmt.Println("Key not found")
+    }
+}
+```
+
+### API Reference
+
+#### `NewStaticFlatMap[KeyType Integer, ValueType any](data map[KeyType]ValueType) *StaticFlatMap[KeyType, ValueType]`
+
+Builds a static map from an existing Go map. Keys are sorted once during construction.
+
+#### `Get(key KeyType) (ValueType, bool)`
+
+Looks up a value by key using binary search. Returns the value and a boolean indicating whether the key was found.
+
+### Performance Characteristics
+
+- **Lookup**: O(log n) via binary search on a sorted key slice
+- **Construction**: O(n log n) for sorting keys
+- **Memory**: Two slices of length n (keys and values)
+
+### When to Use
+
+`StaticFlatMap` is ideal for:
+- Fixed key sets that are known at initialization time
+- Read-heavy workloads with integer keys
+- Cases where predictable memory layout matters more than O(1) hash lookups
+
+Consider a standard Go `map` or `FixedBlockMap` for:
+- Dynamic insertions and deletions
+- String or non-integer keys
+- Very large maps where O(log n) lookup cost matters
+
 ## Directed Graph
 
 The `collections` package provides memory-efficient, dense directed and bidirected graph implementations.
