@@ -112,3 +112,42 @@ func TestGraph(t *testing.T) {
 	assertOutboundNeighbors(3, []uint32{4}, []uint8{t1})
 	assertInboundNeighbors(3, []uint32{1}, []uint8{t1})
 }
+
+func TestGraphBuilderPreservesRowOrder(t *testing.T) {
+	const (
+		la uint8 = 7
+		lb uint8 = 8
+		lc uint8 = 9
+	)
+
+	b := NewGraphBuilder[uint32, uint8](4, true)
+
+	// Multiple out-edges from node 0 in a deliberate, non-sorted order.
+	b.AddEdgeWithLabel(0, 3, la)
+	b.AddEdgeWithLabel(0, 1, lb)
+	b.AddEdgeWithLabel(0, 2, lc)
+	// Multiple in-edges to node 1 in a deliberate order.
+	b.AddEdgeWithLabel(2, 1, la)
+	b.AddEdgeWithLabel(3, 1, lb)
+
+	out := BuildDirectedGraphRow(b.BuildOutboundGraph(), 0)
+	assert.Equal(t, []uint32{3, 1, 2}, out.neighbors)
+	assert.Equal(t, []uint8{la, lb, lc}, out.labels)
+
+	in := BuildDirectedGraphRow(b.BuildInboundGraph(), 1)
+	assert.Equal(t, []uint32{0, 2, 3}, in.neighbors)
+	assert.Equal(t, []uint8{lb, la, lb}, in.labels)
+}
+
+type directedRow struct {
+	neighbors []uint32
+	labels    []uint8
+}
+
+func BuildDirectedGraphRow(g *DirectedGraph[uint32, uint8], node uint32) directedRow {
+	neighbors, labels := g.Neighbors(node)
+	return directedRow{
+		neighbors: append([]uint32(nil), neighbors...),
+		labels:    append([]uint8(nil), labels...),
+	}
+}

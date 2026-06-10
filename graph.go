@@ -181,124 +181,87 @@ func (m *MutableBidirectedGraph[OffsetType, EdgeType]) RemoveEdge(a DenseId, b D
 // ╰────────────────────────────────────────────────────────────────────╯
 
 type GraphBuilder[OffsetType Unsigned, EdgeType any] struct {
-	nodeCount      DenseId
-	inbound        map[DenseId][]DenseId
-	outbound       map[DenseId][]DenseId
-	inboundLabels  map[DenseId][]EdgeType
-	outboundLabels map[DenseId][]EdgeType
+	nodeCount  DenseId
+	withLabels bool
+
+	froms  []DenseId
+	tos    []DenseId
+	labels []EdgeType
 }
 
 func NewGraphBuilder[OffsetType Unsigned, EdgeType any](nodeCount DenseId, withLabels bool) *GraphBuilder[OffsetType, EdgeType] {
-	builder := &GraphBuilder[OffsetType, EdgeType]{
-		nodeCount: nodeCount,
-		inbound:   make(map[DenseId][]DenseId, nodeCount),
-		outbound:  make(map[DenseId][]DenseId, nodeCount),
+	return &GraphBuilder[OffsetType, EdgeType]{
+		nodeCount:  nodeCount,
+		withLabels: withLabels,
 	}
-
-	if withLabels {
-		builder.inboundLabels = make(map[DenseId][]EdgeType, nodeCount)
-		builder.outboundLabels = make(map[DenseId][]EdgeType, nodeCount)
-	}
-
-	return builder
 }
 
 func (b *GraphBuilder[OffsetType, EdgeType]) AddEdgeWithLabel(from DenseId, to DenseId, label EdgeType) {
-	if b.outbound[from] == nil {
-		b.outbound[from] = []DenseId{}
-		b.outboundLabels[from] = []EdgeType{}
+	b.froms = append(b.froms, from)
+	b.tos = append(b.tos, to)
+
+	if b.withLabels {
+		b.labels = append(b.labels, label)
 	}
-
-	b.outbound[from] = append(b.outbound[from], to)
-	b.outboundLabels[from] = append(b.outboundLabels[from], label)
-
-	if b.inbound[to] == nil {
-		b.inbound[to] = []DenseId{}
-		b.inboundLabels[to] = []EdgeType{}
-	}
-
-	b.inbound[to] = append(b.inbound[to], from)
-	b.inboundLabels[to] = append(b.inboundLabels[to], label)
 }
 
 func (b *GraphBuilder[OffsetType, EdgeType]) AddEdge(from DenseId, to DenseId) {
-	var label EdgeType
+	b.froms = append(b.froms, from)
+	b.tos = append(b.tos, to)
 
-	if b.outbound[from] == nil {
-		b.outbound[from] = []DenseId{}
-
-		if b.outboundLabels != nil {
-			b.outboundLabels[from] = []EdgeType{}
-		}
-	}
-
-	b.outbound[from] = append(b.outbound[from], to)
-
-	if b.outboundLabels != nil {
-		b.outboundLabels[from] = append(b.outboundLabels[from], label)
-	}
-
-	if b.inbound[to] == nil {
-		b.inbound[to] = []DenseId{}
-
-		if b.inboundLabels != nil {
-			b.inboundLabels[to] = []EdgeType{}
-		}
-	}
-
-	b.inbound[to] = append(b.inbound[to], from)
-
-	if b.inboundLabels != nil {
-		b.inboundLabels[to] = append(b.inboundLabels[to], label)
+	if b.withLabels {
+		var label EdgeType
+		b.labels = append(b.labels, label)
 	}
 }
 
 func (b *GraphBuilder[OffsetType, EdgeType]) BuildInboundGraph() *DirectedGraph[OffsetType, EdgeType] {
-	offsets := make([]OffsetType, b.nodeCount+1)
-
-	var edges []DenseId
-	var labels []EdgeType
-	var index DenseId
-
-	for index = DenseId(0); index < b.nodeCount; index++ {
-		offsets[index] = OffsetType(len(edges))
-
-		if neighbors, ok := b.inbound[index]; ok {
-			edges = append(edges, neighbors...)
-
-			if b.inboundLabels != nil {
-				neighborLabels := b.inboundLabels[index]
-				labels = append(labels, neighborLabels...)
-			}
-		}
-	}
-
-	offsets[b.nodeCount] = OffsetType(len(edges))
-
-	return NewDirectedGraph(offsets, edges, labels)
+	// Inbound is keyed on the edge target; the neighbor is the edge source.
+	return b.buildCSR(b.tos, b.froms)
 }
 
 func (b *GraphBuilder[OffsetType, EdgeType]) BuildOutboundGraph() *DirectedGraph[OffsetType, EdgeType] {
+	// Outbound is keyed on the edge source; the neighbor is the edge target.
+	return b.buildCSR(b.froms, b.tos)
+}
+
+func (b *GraphBuilder[OffsetType, EdgeType]) buildCSR(keys, neighbors []DenseId) *DirectedGraph[OffsetType, EdgeType] {
+	edgeCount := len(keys)
 	offsets := make([]OffsetType, b.nodeCount+1)
 
-	var edges []DenseId
-	var labels []EdgeType
-	var index DenseId
-
-	for index = DenseId(0); index < b.nodeCount; index++ {
-		offsets[index] = OffsetType(len(edges))
-
-		if neighbors, ok := b.outbound[index]; ok {
-			edges = append(edges, neighbors...)
-
-			if b.outboundLabels != nil {
-				neighborLabels := b.outboundLabels[index]
-				labels = append(labels, neighborLabels...)
-			}
-		}
+	// Count degrees: offsets[key+1] accumulates the number of edges keyed on k.
+	for _, key := range keys {
+		offsets[key+1]++
 	}
 
-	offsets[b.nodeCount] = OffsetType(len(edges))
+	// Prefix-sum into start offsets. offsets[i] becomes node i's start
+	// position and offsets[nodeCount] == edgeCount.
+	for i := DenseId(0); i < b.nodeCount; i++ {
+		offsets[i+1] += offsets[i]
+	}
+
+	edges := make([]DenseId, edgeCount)
+
+	var labels []EdgeType
+	if b.withLabels {
+		labels = make([]EdgeType, edgeCount)
+	}
+
+	// Cursor tracks the next free slot per node, seeded from the start offsets.
+	cursor := make([]OffsetType, b.nodeCount)
+	copy(cursor, offsets[:b.nodeCount])
+
+	for i := 0; i < edgeCount; i++ {
+		key := keys[i]
+		pos := cursor[key]
+		edges[pos] = neighbors[i]
+
+		if b.withLabels {
+			labels[pos] = b.labels[i]
+		}
+
+		cursor[key]++
+	}
 
 	return NewDirectedGraph(offsets, edges, labels)
 }
