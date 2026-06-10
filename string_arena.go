@@ -1,8 +1,12 @@
 package collections
 
 import (
+	"errors"
+	"math"
 	"unsafe"
 )
+
+var EmptyIndexedString = IndexedString(math.MaxUint64)
 
 // StringArena is a fast, chunk-based memory allocator optimized for allocating strings.
 // It pre-allocates contiguous memory blocks (chunks) and copies transient string/byte
@@ -24,6 +28,25 @@ type Stats struct {
 	NumChunks      int // Total number of chunks allocated
 }
 
+// IndexedString holds a reference to a string inside of a StringArena.
+type IndexedString uint64
+
+func newIndexedString(chunk uint8, offset uint32, length uint32) IndexedString {
+	return IndexedString((uint64(chunk) << 56) | (uint64(offset) << 24) | (uint64(length) & 0xFFFFFF))
+}
+
+func (i IndexedString) chunk() uint8 {
+	return uint8(uint64(i) >> 56)
+}
+
+func (i IndexedString) offset() uint32 {
+	return uint32((uint64(i) >> 24) & 0xFFFFFFFF)
+}
+
+func (i IndexedString) length() uint32 {
+	return uint32(uint64(i) & 0xFFFFFF)
+}
+
 // NewStringArena initializes a new StringArena with the given chunk size in bytes.
 // It falls back to a sensible default if the provided size is non-positive.
 func NewStringArena(chunkSize int) *StringArena {
@@ -42,14 +65,17 @@ func NewStringArena(chunkSize int) *StringArena {
 	}
 }
 
-// Alloc copies the content of s into the arena and returns a string pointing
-// to the copied data. The returned string is backed by the arena's memory.
-func (a *StringArena) Alloc(s string) string {
+// Alloc copies the content of s into the arena and returns an index to the copied data.
+func (a *StringArena) Alloc(s string) (IndexedString, error) {
 	if len(s) == 0 {
-		return ""
+		return EmptyIndexedString, nil
 	}
 
 	if a.offset+len(s) > len(a.chunks[a.chunkIndex]) {
+		if a.chunkIndex == math.MaxUint8 {
+			return EmptyIndexedString, errors.New("string arena memory overflow")
+		}
+
 		a.grow(len(s))
 	}
 
@@ -58,19 +84,20 @@ func (a *StringArena) Alloc(s string) string {
 	copy(chunk[start:], s)
 	a.offset += len(s)
 
-	// unsafe.String converts the byte slice pointer and length to a string
-	// without allocating heap memory or copying bytes.
-	return unsafe.String(&chunk[start], len(s))
+	return newIndexedString(uint8(a.chunkIndex), uint32(start), uint32(len(s))), nil
 }
 
-// AllocBytes copies the content of b into the arena and returns a string pointing
-// to the copied data. The returned string is backed by the arena's memory.
-func (a *StringArena) AllocBytes(b []byte) string {
+// AllocBytes copies the content of b into the arena and returns an index to the copied data.
+func (a *StringArena) AllocBytes(b []byte) (IndexedString, error) {
 	if len(b) == 0 {
-		return ""
+		return EmptyIndexedString, nil
 	}
 
 	if a.offset+len(b) > len(a.chunks[a.chunkIndex]) {
+		if a.chunkIndex == math.MaxUint8 {
+			return EmptyIndexedString, errors.New("string arena memory overflow")
+		}
+
 		a.grow(len(b))
 	}
 
@@ -79,9 +106,28 @@ func (a *StringArena) AllocBytes(b []byte) string {
 	copy(chunk[start:], b)
 	a.offset += len(b)
 
-	// unsafe.String converts the byte slice pointer and length to a string
-	// without allocating heap memory or copying bytes.
-	return unsafe.String(&chunk[start], len(b))
+	return newIndexedString(uint8(a.chunkIndex), uint32(start), uint32(len(b))), nil
+}
+
+// Get returns the string for the given index.
+func (a *StringArena) Get(i IndexedString) string {
+	if i == EmptyIndexedString {
+		return ""
+	}
+
+	chunkIdx := int(i.chunk())
+	if chunkIdx < 0 || chunkIdx > a.chunkIndex || chunkIdx >= len(a.chunks) {
+		return ""
+	}
+
+	chunk := a.chunks[chunkIdx]
+	start := int(i.offset())
+	length := int(i.length())
+	if start < 0 || length < 0 || start+length > len(chunk) {
+		return ""
+	}
+
+	return unsafe.String(&chunk[start], length)
 }
 
 // Reset resets the arena, allowing all of its chunks to be reused.

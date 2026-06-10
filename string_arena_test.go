@@ -50,26 +50,31 @@ func TestStringArena_AllocAndAllocBytes(t *testing.T) {
 		"performance",
 	}
 
-	allocated := make([]string, len(inputs))
+	allocated := make([]IndexedString, len(inputs))
+	var err error
 
 	for i, input := range inputs {
 		if i%2 == 0 {
-			allocated[i] = arena.Alloc(input)
+			allocated[i], err = arena.Alloc(input)
+			assert.NoError(t, err)
 		} else {
-			allocated[i] = arena.AllocBytes([]byte(input))
+			allocated[i], err = arena.AllocBytes([]byte(input))
+			assert.NoError(t, err)
 		}
 
+		got := arena.Get(allocated[i])
+
 		// Verify content is identical
-		assert.Equal(t, input, allocated[i])
+		assert.Equal(t, input, got)
 
 		// Verify the memory is indeed inside the arena chunks
-		strPtr := unsafe.StringData(allocated[i])
+		strPtr := unsafe.StringData(got)
 		assert.True(t, isPointerInChunks(strPtr, arena), "allocated string must be stored within the arena's memory")
 	}
 
 	// Verify all strings are still intact and didn't corrupt each other
 	for i, input := range inputs {
-		assert.Equal(t, input, allocated[i])
+		assert.Equal(t, input, arena.Get(allocated[i]))
 	}
 
 	stats := arena.Stats()
@@ -81,14 +86,19 @@ func TestStringArena_Grow(t *testing.T) {
 	arena := NewStringArena(1024) // 1024 bytes chunk size
 
 	// Chunk size is 1024. Let's write strings that cross the 1024 boundary.
-	str1 := arena.Alloc(string(make([]byte, 600)))
+	idx1, err := arena.Alloc(string(make([]byte, 600)))
+	assert.NoError(t, err)
 	assert.Equal(t, 1, arena.Stats().NumChunks)
 
 	// This allocation should exceed the remaining ~424 bytes in the first chunk, trigger growth,
 	// and allocate a second chunk of 1024 bytes.
-	str2 := arena.Alloc(string(make([]byte, 500)))
+	idx2, err := arena.Alloc(string(make([]byte, 500)))
+	assert.NoError(t, err)
 	stats := arena.Stats()
 	assert.Equal(t, 2, stats.NumChunks)
+
+	str1 := arena.Get(idx1)
+	str2 := arena.Get(idx2)
 
 	// Check that both strings are backed by the arena and distinct
 	assert.Len(t, str1, 600)
@@ -105,9 +115,11 @@ func TestStringArena_VeryLargeString(t *testing.T) {
 	largeStrSize := 5000
 	largeInput := string(make([]byte, largeStrSize))
 
-	allocated := arena.Alloc(largeInput)
-	assert.Equal(t, largeStrSize, len(allocated))
-	assert.True(t, isPointerInChunks(unsafe.StringData(allocated), arena))
+	idx, err := arena.Alloc(largeInput)
+	assert.NoError(t, err)
+	got := arena.Get(idx)
+	assert.Equal(t, largeStrSize, len(got))
+	assert.True(t, isPointerInChunks(unsafe.StringData(got), arena))
 
 	stats := arena.Stats()
 	assert.Equal(t, 2, stats.NumChunks) // First default chunk (1024) + second customized chunk (5000)
@@ -118,9 +130,9 @@ func TestStringArena_ResetAndReuse(t *testing.T) {
 	arena := NewStringArena(1024) // 1024 bytes chunk size
 
 	// Phase 1: Allocate several strings causing a grow to 3 chunks
-	_ = arena.Alloc(string(make([]byte, 800)))
-	_ = arena.Alloc(string(make([]byte, 800)))
-	_ = arena.Alloc(string(make([]byte, 800)))
+	_, _ = arena.Alloc(string(make([]byte, 800)))
+	_, _ = arena.Alloc(string(make([]byte, 800)))
+	_, _ = arena.Alloc(string(make([]byte, 800)))
 
 	statsPhase1 := arena.Stats()
 	assert.Equal(t, 3, statsPhase1.NumChunks)
@@ -132,10 +144,13 @@ func TestStringArena_ResetAndReuse(t *testing.T) {
 	assert.Equal(t, 0, statsReset.TotalUsed)
 
 	// Phase 2: Re-allocate and verify we don't allocate new chunks unless needed
-	s1 := arena.Alloc("hello")
-	s2 := arena.Alloc("world")
-	assert.Equal(t, "hello", s1)
-	assert.Equal(t, "world", s2)
+	idx1, err := arena.Alloc("hello")
+	assert.NoError(t, err)
+	idx2, err := arena.Alloc("world")
+	assert.NoError(t, err)
+
+	assert.Equal(t, "hello", arena.Get(idx1))
+	assert.Equal(t, "world", arena.Get(idx2))
 
 	statsPhase2 := arena.Stats()
 	assert.Equal(t, 3, statsPhase2.NumChunks) // Still 3 chunks (reused first chunk)
@@ -143,11 +158,11 @@ func TestStringArena_ResetAndReuse(t *testing.T) {
 
 	// Trigger a grow inside reuse
 	// Allocate 900 bytes (fits in chunk 1, since chunkIndex=0, offset=10 => remaining is 1014)
-	_ = arena.Alloc(string(make([]byte, 900)))
+	_, _ = arena.Alloc(string(make([]byte, 900)))
 
 	// Now allocate another 900 bytes. This won't fit in chunk 1 (remaining ~114).
 	// It should move to chunk 2 (which is 1024 bytes and satisfies 900) without creating a 4th chunk.
-	_ = arena.Alloc(string(make([]byte, 900)))
+	_, _ = arena.Alloc(string(make([]byte, 900)))
 
 	statsPhase3 := arena.Stats()
 	assert.Equal(t, 3, statsPhase3.NumChunks) // Still reused chunk 2
@@ -157,18 +172,18 @@ func TestStringArena_ResetAndReuseWithResize(t *testing.T) {
 	arena := NewStringArena(1024) // 1024 bytes chunk size
 
 	// Allocate so we have a second chunk
-	_ = arena.Alloc(string(make([]byte, 800)))
-	_ = arena.Alloc(string(make([]byte, 800)))
+	_, _ = arena.Alloc(string(make([]byte, 800)))
+	_, _ = arena.Alloc(string(make([]byte, 800)))
 	assert.Equal(t, 2, arena.Stats().NumChunks)
 
 	arena.Reset()
 
 	// Fill the first chunk
-	_ = arena.Alloc(string(make([]byte, 800)))
+	_, _ = arena.Alloc(string(make([]byte, 800)))
 
 	// Allocate a large string that exceeds the second chunk's size (1024)
 	// This should replace the second chunk with a larger one
-	_ = arena.Alloc(string(make([]byte, 2000)))
+	_, _ = arena.Alloc(string(make([]byte, 2000)))
 
 	stats := arena.Stats()
 	assert.Equal(t, 2, stats.NumChunks)
@@ -178,9 +193,6 @@ func TestStringArena_ResetAndReuseWithResize(t *testing.T) {
 func TestStringArena_EmptyInputs(t *testing.T) {
 	arena := NewStringArena(1024)
 
-	assert.Equal(t, "", arena.Alloc(""))
-	assert.Equal(t, "", arena.AllocBytes(nil))
-	assert.Equal(t, "", arena.AllocBytes([]byte{}))
-
+	assert.Equal(t, "", arena.Get(EmptyIndexedString))
 	assert.Equal(t, 0, arena.Stats().TotalUsed)
 }
