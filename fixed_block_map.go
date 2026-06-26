@@ -8,7 +8,6 @@ import (
 	"io"
 	"iter"
 	"math/bits"
-	"reflect"
 	"unsafe"
 
 	"github.com/cespare/xxhash/v2"
@@ -463,12 +462,10 @@ func (m *FixedBlockMap[V]) WriteTo(w io.Writer) (int64, error) {
 	blockSize := unsafe.Sizeof(m.blocks[0])
 	totalSize := int(blockSize) * len(m.blocks)
 
-	// Map the slice memory directly to a []byte for writing
-	var blocks []byte
-	header := (*reflect.SliceHeader)(unsafe.Pointer(&blocks))
-	header.Data = uintptr(unsafe.Pointer(&m.blocks[0]))
-	header.Len = totalSize
-	header.Cap = totalSize
+	// Reinterpret the slice's backing array as a []byte. unsafe.SliceData
+	// returns a real pointer (not a uintptr), so the GC keeps the backing
+	// array alive for the duration of the write.
+	blocks := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(m.blocks))), totalSize)
 
 	// Perform the write
 	written, err := w.Write(blocks)
@@ -486,12 +483,10 @@ func (m *FixedBlockMap[V]) ReadFrom(r io.Reader) (int64, error) {
 	blockSize := unsafe.Sizeof(m.blocks[0])
 	totalSize := int(blockSize) * len(m.blocks)
 
-	// Map the slice memory directly to a []byte for reading
-	var blocks []byte
-	header := (*reflect.SliceHeader)(unsafe.Pointer(&blocks))
-	header.Data = uintptr(unsafe.Pointer(&m.blocks[0]))
-	header.Len = totalSize
-	header.Cap = totalSize
+	// Reinterpret the slice's backing array as a []byte. unsafe.SliceData
+	// returns a real pointer (not a uintptr), so the GC keeps the backing
+	// array alive for the duration of the read.
+	blocks := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(m.blocks))), totalSize)
 
 	// Read directly into the buckets memory
 	read, err := io.ReadFull(r, blocks)

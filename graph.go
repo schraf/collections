@@ -11,12 +11,30 @@ type DenseId = uint32
 // ╰────────────────────────────────────────────────────────────────────╯
 
 type DirectedGraph[OffsetType Unsigned, EdgeType any] struct {
-	offsets []OffsetType
-	edges   []DenseId
-	labels  []EdgeType
+	offsets Array[OffsetType]
+	edges   Array[DenseId]
+	labels  Array[EdgeType]
 }
 
+// NewDirectedGraph builds a directed graph from in-memory CSR slices. The
+// slices are wrapped in SliceArrays and retained by reference. A nil labels
+// slice indicates an unlabeled graph.
 func NewDirectedGraph[OffsetType Unsigned, EdgeType any](offsets []OffsetType, edges []DenseId, labels []EdgeType) *DirectedGraph[OffsetType, EdgeType] {
+	var labelArray Array[EdgeType]
+	if labels != nil {
+		labelArray = NewSliceArray(labels)
+	}
+
+	return &DirectedGraph[OffsetType, EdgeType]{
+		offsets: NewSliceArray(offsets),
+		edges:   NewSliceArray(edges),
+		labels:  labelArray,
+	}
+}
+
+// NewDirectedGraphFromArrays builds a directed graph from arbitrary Array
+// backends. A nil labels array indicates an unlabeled graph.
+func NewDirectedGraphFromArrays[OffsetType Unsigned, EdgeType any](offsets Array[OffsetType], edges Array[DenseId], labels Array[EdgeType]) *DirectedGraph[OffsetType, EdgeType] {
 	return &DirectedGraph[OffsetType, EdgeType]{
 		offsets: offsets,
 		edges:   edges,
@@ -24,23 +42,83 @@ func NewDirectedGraph[OffsetType Unsigned, EdgeType any](offsets []OffsetType, e
 	}
 }
 
-func (g *DirectedGraph[OffsetType, EdgeType]) Neighbors(denseId DenseId) ([]DenseId, []EdgeType) {
-	if int(denseId) >= len(g.offsets)-1 {
-		return nil, nil
+// Neighbors returns the destination node IDs and corresponding labels for the
+// given node. When the graph is backed by in-memory slices the returned slices
+// are zero-copy views into internal storage and must not be modified; when
+// backed by a paged array the data is copied into freshly allocated slices.
+//
+// For allocation-free traversal that works identically across backends, prefer
+// NeighborsInto.
+func (g *DirectedGraph[OffsetType, EdgeType]) Neighbors(denseId DenseId) ([]DenseId, []EdgeType, error) {
+	if int(denseId) >= g.offsets.Len()-1 {
+		return nil, nil, nil
 	}
 
-	start := g.offsets[denseId]
-	end := g.offsets[denseId+1]
+	startVal, err := g.offsets.At(int(denseId))
+	if err != nil {
+		return nil, nil, err
+	}
+	start := int(startVal)
 
-	neighbors := g.edges[start:end]
+	endVal, err := g.offsets.At(int(denseId) + 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	end := int(endVal)
+
+	neighbors, err := g.edges.Slice(start, end, nil)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	var labels []EdgeType
 
 	if g.labels != nil {
-		labels = g.labels[start:end]
+		labels, err = g.labels.Slice(start, end, nil)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
-	return neighbors, labels
+	return neighbors, labels, nil
+}
+
+// NeighborsInto copies the neighbors (and labels, when present) of the given
+// node into the supplied buffers, growing them as needed, and returns the
+// filled sub-slices. This is allocation-free across repeated calls when the
+// buffers are reused and is safe against page eviction for disk-backed graphs.
+// Pass a nil labelBuf for unlabeled graphs.
+func (g *DirectedGraph[OffsetType, EdgeType]) NeighborsInto(denseId DenseId, edgeBuf []DenseId, labelBuf []EdgeType) ([]DenseId, []EdgeType, error) {
+	if int(denseId) >= g.offsets.Len()-1 {
+		return edgeBuf[:0], labelBuf[:0], nil
+	}
+
+	startVal, err := g.offsets.At(int(denseId))
+	if err != nil {
+		return nil, nil, err
+	}
+	start := int(startVal)
+
+	endVal, err := g.offsets.At(int(denseId) + 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	end := int(endVal)
+
+	neighbors, err := g.edges.Slice(start, end, edgeBuf)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var labels []EdgeType
+	if g.labels != nil {
+		labels, err = g.labels.Slice(start, end, labelBuf)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return neighbors, labels, nil
 }
 
 // ╭────────────────────────────────────────────────────────────────────╮
@@ -99,11 +177,14 @@ func (g *MutableDirectedGraph[OffsetType, EdgeType]) RemoveEdge(a DenseId, b Den
 	g.removedEdges[a][b] = struct{}{}
 }
 
-func (g *MutableDirectedGraph[OffsetType, EdgeType]) Neighbors(denseId DenseId) ([]DenseId, []EdgeType) {
+func (g *MutableDirectedGraph[OffsetType, EdgeType]) Neighbors(denseId DenseId) ([]DenseId, []EdgeType, error) {
 	var neighbors []DenseId
 	var labels []EdgeType
 
-	baseNeighbors, baseLabels := g.DirectedGraph.Neighbors(denseId)
+	baseNeighbors, baseLabels, err := g.DirectedGraph.Neighbors(denseId)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	g.lock.RLock()
 	defer g.lock.RUnlock()
@@ -113,7 +194,7 @@ func (g *MutableDirectedGraph[OffsetType, EdgeType]) Neighbors(denseId DenseId) 
 
 	// early out if no modifications have been done to this node
 	if !hasDeletes && !hasAdded {
-		return baseNeighbors, baseLabels
+		return baseNeighbors, baseLabels, nil
 	}
 
 	if hasDeletes {
@@ -145,7 +226,7 @@ func (g *MutableDirectedGraph[OffsetType, EdgeType]) Neighbors(denseId DenseId) 
 		}
 	}
 
-	return neighbors, labels
+	return neighbors, labels, nil
 }
 
 // ╭────────────────────────────────────────────────────────────────────╮

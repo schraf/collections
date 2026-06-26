@@ -57,14 +57,16 @@ func TestGraph(t *testing.T) {
 
 	assertOutboundNeighbors := func(node uint32, expectedNeighbors []uint32, expectedLabels []uint8) {
 		t.Helper()
-		foundNeighbors, foundLabels := graph.Outbound.Neighbors(node)
+		foundNeighbors, foundLabels, err := graph.Outbound.Neighbors(node)
+		assert.NoError(t, err)
 		assertNeighbors(foundNeighbors, expectedNeighbors)
 		assertLabels(foundLabels, expectedLabels)
 	}
 
 	assertInboundNeighbors := func(node uint32, expectedNeighbors []uint32, expectedLabels []uint8) {
 		t.Helper()
-		foundNeighbors, foundLabels := graph.Inbound.Neighbors(node)
+		foundNeighbors, foundLabels, err := graph.Inbound.Neighbors(node)
+		assert.NoError(t, err)
 		assertNeighbors(foundNeighbors, expectedNeighbors)
 		assertLabels(foundLabels, expectedLabels)
 	}
@@ -145,7 +147,10 @@ type directedRow struct {
 }
 
 func BuildDirectedGraphRow(g *DirectedGraph[uint32, uint8], node uint32) directedRow {
-	neighbors, labels := g.Neighbors(node)
+	neighbors, labels, err := g.Neighbors(node)
+	if err != nil {
+		panic(err)
+	}
 	return directedRow{
 		neighbors: append([]uint32(nil), neighbors...),
 		labels:    append([]uint8(nil), labels...),
