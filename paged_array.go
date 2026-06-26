@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,12 @@ type Page struct {
 	key   uint64
 	data  []byte
 	dirty bool
+}
+
+type PagedArrayMeta struct {
+	Version     int    `json:"version"`
+	Length      int    `json:"length"`
+	ElementSize uint64 `json:"element_size"`
 }
 
 // PagedArray is a disk-backed, fixed-page array of T with a bounded in-RAM
@@ -50,6 +57,9 @@ type PagedArray[T any] struct {
 	elementSize     uint64
 	elementsPerPage uint64
 	pagesPerSegment uint64
+
+	length int
+	dirty  bool
 }
 
 func NewPagedArray[T any](directory string, maxLoadedPages int) (*PagedArray[T], error) {
@@ -67,12 +77,43 @@ func NewPagedArray[T any](directory string, maxLoadedPages int) (*PagedArray[T],
 		return nil, err
 	}
 
+	metaPath := filepath.Join(directory, "meta.json")
+	metaBytes, err := os.ReadFile(metaPath)
+	dirty := false
+	var meta PagedArrayMeta
+
+	if errors.Is(err, os.ErrNotExist) {
+		meta = PagedArrayMeta{
+			Version:     1,
+			Length:      0,
+			ElementSize: elementSize,
+		}
+
+		dirty = true
+	} else if err != nil {
+		return nil, err
+	} else {
+		if err := json.Unmarshal(metaBytes, &meta); err != nil {
+			return nil, err
+		}
+
+		if meta.Version != 1 {
+			return nil, fmt.Errorf("unsupported PagedArray version: %d", meta.Version)
+		}
+
+		if meta.ElementSize != elementSize {
+			return nil, fmt.Errorf("element size mismatch: file has %d bytes, type has %d bytes", meta.ElementSize, elementSize)
+		}
+	}
+
 	array := &PagedArray[T]{
 		directory:       directory,
 		files:           make(map[uint64]*os.File),
 		elementSize:     elementSize,
 		elementsPerPage: elementsPerPage,
 		pagesPerSegment: pagesPerSegment,
+		length:          meta.Length,
+		dirty:           dirty,
 	}
 
 	cache, err := lru.NewWithEvict[uint64, *Page](maxLoadedPages, func(key uint64, page *Page) {
@@ -88,17 +129,25 @@ func NewPagedArray[T any](directory string, maxLoadedPages int) (*PagedArray[T],
 	return array, nil
 }
 
-func (a *PagedArray[T]) Get(index uint64) (T, error) {
+func (a *PagedArray[T]) Len() int {
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	return a.length
+}
+
+func (a *PagedArray[T]) At(index int) (T, error) {
 	a.lock.Lock()
 	defer a.lock.Unlock()
 
-	globalPageKey := index / a.elementsPerPage
-	elementOffset := index % a.elementsPerPage
+	var zero T
+
+	idx := uint64(index)
+	globalPageKey := idx / a.elementsPerPage
+	elementOffset := idx % a.elementsPerPage
 	byteOffset := elementOffset * a.elementSize
 
 	page, err := a.getPage(globalPageKey)
 	if err != nil {
-		var zero T
 		return zero, err
 	}
 
@@ -110,12 +159,13 @@ func (a *PagedArray[T]) Get(index uint64) (T, error) {
 	return value, nil
 }
 
-func (a *PagedArray[T]) Set(index uint64, value T) error {
+func (a *PagedArray[T]) Set(index int, value T) error {
 	a.lock.Lock()
 	defer a.lock.Unlock()
 
-	globalPageKey := index / a.elementsPerPage
-	elementOffset := index % a.elementsPerPage
+	idx := uint64(index)
+	globalPageKey := idx / a.elementsPerPage
+	elementOffset := idx % a.elementsPerPage
 	byteOffset := elementOffset * a.elementSize
 
 	page, err := a.getPage(globalPageKey)
@@ -128,19 +178,129 @@ func (a *PagedArray[T]) Set(index uint64, value T) error {
 	copy(dst, src)
 
 	page.dirty = true
+
+	if index >= a.length {
+		a.length = index + 1
+	}
+
+	a.dirty = true
+
 	return nil
 }
 
+func (a *PagedArray[T]) Slice(start int, end int, dest []T) ([]T, error) {
+	a.lock.Lock()
+	defer a.lock.Unlock()
+
+	count := end - start
+	if count <= 0 {
+		if dest == nil {
+			return []T{}, nil
+		}
+
+		return dest[:0], nil
+	}
+
+	if cap(dest) < count {
+		dest = make([]T, count)
+	}
+
+	dest = dest[:count]
+
+	// Copy data page by page
+	elementsCopied := 0
+
+	for elementsCopied < count {
+		currentIndex := uint64(start + elementsCopied)
+		globalPageKey := currentIndex / a.elementsPerPage
+		elementOffset := currentIndex % a.elementsPerPage
+
+		page, err := a.getPage(globalPageKey)
+		if err != nil {
+			return nil, err
+		}
+
+		elementsToCopyFromPage := a.elementsPerPage - elementOffset
+		if elementsCopied+int(elementsToCopyFromPage) > count {
+			elementsToCopyFromPage = uint64(count - elementsCopied)
+		}
+
+		byteOffset := elementOffset * a.elementSize
+		byteLength := elementsToCopyFromPage * a.elementSize
+
+		src := page.data[byteOffset : byteOffset+byteLength]
+
+		// Use unsafe pointer to copy directly into dest slice
+		dstPtr := unsafe.Pointer(&dest[elementsCopied])
+		dst := (*[1 << 30]byte)(dstPtr)[:byteLength:byteLength]
+		copy(dst, src)
+
+		elementsCopied += int(elementsToCopyFromPage)
+	}
+
+	return dest, nil
+}
+
+func (a *PagedArray[T]) Flush() error {
+	a.lock.Lock()
+	defer a.lock.Unlock()
+
+	if !a.dirty {
+		return nil
+	}
+
+	var err error
+
+	keys := a.cache.Keys()
+
+	for _, key := range keys {
+		if page, ok := a.cache.Peek(key); ok {
+			if page.dirty {
+				if writeError := a.writePage(page); writeError != nil {
+					err = errors.Join(err, writeError)
+				} else {
+					page.dirty = false
+				}
+			}
+		}
+	}
+
+	meta := PagedArrayMeta{
+		Version:     1,
+		Length:      a.length,
+		ElementSize: a.elementSize,
+	}
+
+	metaBytes, writeError := json.Marshal(meta)
+	if writeError != nil {
+		err = errors.Join(err, writeError)
+	} else {
+		metaPath := filepath.Join(a.directory, "meta.json")
+
+		if writeError := os.WriteFile(metaPath, metaBytes, 0644); writeError != nil {
+			err = errors.Join(err, writeError)
+		}
+	}
+
+	a.dirty = false
+	return err
+}
+
 func (a *PagedArray[T]) Close() error {
+	// Don't lock yet because Flush locks
+	var err error
+
+	if flushErr := a.Flush(); flushErr != nil {
+		err = errors.Join(err, flushErr)
+	}
+
 	a.lock.Lock()
 	defer a.lock.Unlock()
 
 	a.cache.Purge() // Automatically triggers OnEvict for all loaded pages
 
-	var err error
-
 	for _, file := range a.files {
-		errors.Join(err, file.Close())
+		err = errors.Join(err, file.Close())
 	}
 
 	return err

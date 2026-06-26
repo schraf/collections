@@ -27,15 +27,15 @@ func TestPagedArray_Basics(t *testing.T) {
 	require.NoError(t, err)
 
 	// Get values
-	val, err := pa.Get(0)
+	val, err := pa.At(0)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(100), val)
 
-	val, err = pa.Get(1)
+	val, err = pa.At(1)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(200), val)
 
-	val, err = pa.Get(1000)
+	val, err = pa.At(1000)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(300), val)
 
@@ -50,7 +50,7 @@ func TestPagedArray_Eviction(t *testing.T) {
 	pa, err := NewPagedArray[uint64](tempDir, 2)
 	require.NoError(t, err)
 
-	elementsPerPage := uint64(PageSize) / 8 // 512
+	elementsPerPage := int(PageSize) / 8 // 512
 
 	// Write to 3 different pages, forcing eviction
 	require.NoError(t, pa.Set(0, 10))
@@ -58,15 +58,15 @@ func TestPagedArray_Eviction(t *testing.T) {
 	require.NoError(t, pa.Set(elementsPerPage*2, 30))
 
 	// Get first element, which should have been evicted to disk
-	val, err := pa.Get(0)
+	val, err := pa.At(0)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(10), val)
 
-	val, err = pa.Get(elementsPerPage)
+	val, err = pa.At(elementsPerPage)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(20), val)
 
-	val, err = pa.Get(elementsPerPage*2)
+	val, err = pa.At(elementsPerPage*2)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(30), val)
 
@@ -88,16 +88,16 @@ func TestPagedArray_Persistence(t *testing.T) {
 	pa2, err := NewPagedArray[int32](tempDir, 5)
 	require.NoError(t, err)
 
-	val, err := pa2.Get(50)
+	val, err := pa2.At(50)
 	require.NoError(t, err)
 	assert.Equal(t, int32(42), val)
 
-	val, err = pa2.Get(10000)
+	val, err = pa2.At(10000)
 	require.NoError(t, err)
 	assert.Equal(t, int32(84), val)
 
 	// Unset values should be zero
-	val, err = pa2.Get(51)
+	val, err = pa2.At(51)
 	require.NoError(t, err)
 	assert.Equal(t, int32(0), val)
 
@@ -127,13 +127,13 @@ func TestPagedArray_MultipleSegments(t *testing.T) {
 	// SegmentSize = 1 << 30 (1GB)
 	// elementSize = 8 bytes
 	// elementsPerSegment = SegmentSize / 8
-	elementsPerSegment := uint64(SegmentSize) / 8
+	elementsPerSegment := int(SegmentSize) / 8
 
 	// Write to segment 1
 	idx1 := elementsPerSegment + 10
 	require.NoError(t, pa.Set(idx1, 999))
 
-	val, err := pa.Get(idx1)
+	val, err := pa.At(idx1)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(999), val)
 

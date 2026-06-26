@@ -7,8 +7,8 @@ package collections
 // Implementations must be safe for concurrent readers.
 type Array[T any] interface {
 	Len() int
-	At(index int) T
-	Slice(start int, end int, dest []T) []T
+	At(index int) (T, error)
+	Slice(start int, end int, dest []T) ([]T, error)
 }
 
 // SliceArray is an in-memory Array[T] backed by a plain Go slice. It adds no
@@ -25,13 +25,13 @@ func (a *SliceArray[T]) Len() int {
 	return len(a.data)
 }
 
-func (a *SliceArray[T]) At(index int) T {
-	return a.data[index]
+func (a *SliceArray[T]) At(index int) (T, error) {
+	return a.data[index], nil
 }
 
-func (a *SliceArray[T]) Slice(start int, end int, dest []T) []T {
+func (a *SliceArray[T]) Slice(start int, end int, dest []T) ([]T, error) {
 	if dest == nil {
-		return a.data[start:end]
+		return a.data[start:end], nil
 	}
 
 	count := end - start
@@ -41,5 +41,5 @@ func (a *SliceArray[T]) Slice(start int, end int, dest []T) []T {
 
 	dest = dest[:count]
 	copy(dest, a.data[start:end])
-	return dest
+	return dest, nil
 }

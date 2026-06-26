@@ -348,11 +348,9 @@ The `collections` package provides memory-efficient, dense directed and bidirect
 
 The base `DirectedGraph` is immutable and stores adjacencies in Compressed Sparse Row (CSR) form using three parallel arrays: `offsets`, `edges`, and `labels`. This guarantees optimal memory locality and zero garbage collection overhead per edge.
 
-Each of the three arrays is held behind the `Array[T]` interface rather than as a raw slice. This lets a graph be backed either by plain in-memory slices (`SliceArray`, the default, with zero overhead and zero-copy traversal) or by disk-resident, LRU-paged storage (`PagedArray`) for graphs too large to fit in RAM. See the `PagedArray` section below.
+Each of the three arrays is held behind the `Array[T]` interface rather than as a raw slice. This allows the graph to be backed by different storage implementations, with the default `SliceArray` providing zero-overhead, zero-copy traversal over plain in-memory slices.
 
 The `MutableDirectedGraph` wraps an immutable `DirectedGraph` and uses internal maps (`addedEdges`, `removedEdges`) to track additions and deletions. It combines these modifications on-the-fly during neighbor traversal, enabling fast edge mutations without rebuilding the underlying arrays.
-
-For very large graphs that cannot be held in memory even during construction, `StreamingGraphBuilder` accumulates edges on disk and builds the CSR via an external counting sort, scattering edges directly into disk-backed paged arrays without ever materializing the full edge set in RAM.
 
 ### Usage
 
@@ -380,7 +378,10 @@ func main() {
 	graph := builder.BuildOutboundGraph()
 
 	// Traverse neighbors of node 0
-	neighbors, labels := graph.Neighbors(0)
+	neighbors, labels, err := graph.Neighbors(0)
+	if err != nil {
+		panic(err)
+	}
 	for i, neighbor := range neighbors {
 		fmt.Printf("0 -> %d (Label: %d)\n", neighbor, labels[i])
 	}
@@ -415,7 +416,10 @@ func main() {
 	mutableGraph.RemoveEdge(0, 1)
 
 	// Traversal will now reflect added and removed edges
-	neighbors, labels := mutableGraph.Neighbors(0)
+	neighbors, labels, err := mutableGraph.Neighbors(0)
+	if err != nil {
+		panic(err)
+	}
 	for i, neighbor := range neighbors {
 		fmt.Printf("0 -> %d (Label: %d)\n", neighbor, labels[i])
 	}
@@ -444,17 +448,17 @@ Constructs an immutable directed graph keyed by source nodes (outbound edges).
 
 Constructs an immutable directed graph keyed by destination nodes (inbound edges).
 
-#### `(*DirectedGraph).Neighbors(nodeId uint32) ([]uint32, []uint8)`
+#### `(*DirectedGraph).Neighbors(nodeId uint32) ([]uint32, []uint8, error)`
 
-Returns the destination node IDs and their corresponding labels for the given node. For in-memory (`SliceArray`-backed) graphs the returned slices are zero-copy references to the graph's internal arrays and must not be modified. For disk-backed (`PagedArray`-backed) graphs the data is copied into freshly allocated slices.
+Returns the destination node IDs and their corresponding labels for the given node. The returned slices may be zero-copy references to the graph's internal arrays (depending on the `Array` backend) and must not be modified.
 
-#### `(*DirectedGraph).NeighborsInto(nodeId uint32, edgeBuf []uint32, labelBuf []uint8) ([]uint32, []uint8)`
+#### `(*DirectedGraph).NeighborsInto(nodeId uint32, edgeBuf []uint32, labelBuf []uint8) ([]uint32, []uint8, error)`
 
-Copies the neighbors (and labels, when present) of `nodeId` into the supplied buffers, growing them as needed, and returns the filled sub-slices. Reusing the buffers across calls makes traversal allocation-free, and the copied results are safe against page eviction for disk-backed graphs. This is the recommended accessor for paged graphs. Pass a `nil` `labelBuf` for unlabeled graphs.
+Copies the neighbors (and labels, when present) of `nodeId` into the supplied buffers, growing them as needed, and returns the filled sub-slices. Reusing the buffers across calls makes traversal allocation-free. Pass a `nil` `labelBuf` for unlabeled graphs.
 
 #### `NewDirectedGraphFromArrays[OffsetType, EdgeType](offsets Array[OffsetType], edges Array[DenseId], labels Array[EdgeType]) *DirectedGraph`
 
-Builds a directed graph from arbitrary `Array` backends (for example, disk-backed `PagedArray`s). A `nil` `labels` array indicates an unlabeled graph. The slice-based `NewDirectedGraph` remains available and wraps its inputs in `SliceArray`s automatically.
+Builds a directed graph from arbitrary `Array` backends. A `nil` `labels` array indicates an unlabeled graph. The slice-based `NewDirectedGraph` remains available and wraps its inputs in `SliceArray`s automatically.
 
 #### `NewMutableDirectedGraph(base DirectedGraph) *MutableDirectedGraph`
 
@@ -468,7 +472,7 @@ Adds a new edge to the mutable graph, with or without an explicit label. These o
 
 Removes an edge from the mutable graph. This operation is thread-safe.
 
-#### `(*MutableDirectedGraph).Neighbors(nodeId uint32) ([]uint32, []uint8)`
+#### `(*MutableDirectedGraph).Neighbors(nodeId uint32) ([]uint32, []uint8, error)`
 
 Returns the neighbors, reflecting both edges from the base graph and any applied additions or removals.
 
@@ -476,27 +480,6 @@ Returns the neighbors, reflecting both edges from the base graph and any applied
 
 Containers for paired outbound and inbound graphs, offering `AddEdge` and `RemoveEdge` that automatically update both directions simultaneously.
 
-#### `StreamingGraphBuilder`
-
-Builds a CSR `DirectedGraph` backed by disk-resident `PagedArray`s without holding the full edge set in memory.
-
-```go
-sb, err := collections.NewStreamingGraphBuilder[uint64, uint8](dir, nodeCount, true /* withLabels */, budgetBytes, pageSizeBytes)
-if err != nil {
-    panic(err)
-}
-defer sb.Close()
-
-sb.AddEdgeWithLabel(0, 1, 10)
-sb.AddEdge(0, 2) // zero label when the graph is labeled
-
-graph, err := sb.BuildOutboundGraph() // or BuildInboundGraph()
-if err != nil {
-    panic(err)
-}
-```
-
-Edges are appended to an on-disk scratch stream as they arrive. `BuildOutboundGraph`/`BuildInboundGraph` then perform a two-pass counting sort, scattering edges and labels directly into pre-sized, writable paged-array files before reopening them read-only for traversal. The per-node `offsets` and scatter cursor are kept in memory (their size is proportional to the node count, not the edge count); the edge data — the dominant term for large graphs — is what streams through disk. `budgetBytes` bounds the resident memory of each paged array used during the build. As with `PagedArray`, `EdgeType` must be a pointer-free value type.
 
 ### Performance Characteristics
 
@@ -510,34 +493,34 @@ Edges are appended to an on-disk scratch stream as they arrive. `BuildOutboundGr
 - When you need high-performance traversal with minimal memory overhead.
 - When you need to incrementally mutate a large base graph (using `MutableDirectedGraph`).
 
-## Array & PagedArray
+## Array
 
-`Array[T]` is a small, read-only abstraction over an indexable sequence of `T`. It decouples consumers (such as the directed graph) from where the backing data lives: entirely in RAM or paged on and off disk.
+`Array[T]` is a read-only abstraction over an indexable sequence of `T`. It decouples consumers (such as the directed graph) from where the backing data lives.
 
 ```go
 type Array[T any] interface {
     Len() int
-    At(i int) T
-    Slice(start, end int, dst []T) []T
+    At(index int) (T, error)
+    Slice(start, end int, dst []T) ([]T, error)
 }
 ```
 
-Two implementations are provided:
+An in-memory implementation is provided:
 
 - **`SliceArray[T]`** — a zero-overhead wrapper over a plain Go slice. `Slice(start, end, nil)` returns a zero-copy view of the underlying storage; passing a non-`nil` `dst` copies the range into it.
-- **`PagedArray[T]`** — a disk-backed, fixed-page array with a bounded in-RAM footprint maintained by an LRU page cache.
 
-### PagedArray
+## PagedArray
 
-`PagedArray[T]` presents the abstraction of an indexable `[]T` whose backing data lives in a file on disk. Pages are faulted into memory on access and evicted (least-recently-used first) once a configured RAM budget is exceeded. It is designed for environments such as containers with mounted external storage where an explicit, predictable memory ceiling is required and where OS page-cache backed `mmap` would not actually offload memory.
+`PagedArray[T]` is a disk-backed, fixed-page array with a bounded in-RAM footprint maintained by an LRU page cache. It presents the abstraction of an indexable array whose backing data lives in a directory on disk. Pages are faulted into memory on access and evicted (least-recently-used first) once the configured max loaded pages limit is exceeded.
+
+It is designed for environments such as containers with mounted external storage where an explicit, predictable memory ceiling is required and where OS page-cache backed `mmap` would not actually offload memory.
 
 #### Features
 
-- **Bounded memory**: resident memory is capped at `max(1, budgetBytes / pageSize)` pages, giving a hard, predictable ceiling regardless of data size.
-- **Explicit LRU paging**: pages are read from disk via `ReadAt` on demand and evicted least-recently-used first; evicted page buffers are recycled to limit allocation churn.
-- **Zero-copy raw serialization**: elements are copied to and from disk as raw memory using `unsafe.Slice`/`unsafe.SliceData`.
-- **Run-oriented access**: `Slice` copies a contiguous element range (spanning pages as needed) into a caller-provided buffer, which is ideal for reading a CSR adjacency row in one call.
-- **Concurrent reads**: safe for use by multiple goroutines.
+- **Bounded memory**: resident memory is capped at a fixed number of pages, giving a hard, predictable ceiling regardless of data size.
+- **Explicit LRU paging**: pages are read from disk on demand and evicted least-recently-used first. Dirty pages are written back on eviction.
+- **Raw serialization**: elements are copied to and from disk as raw memory using `unsafe.Pointer`.
+- **Concurrent safe**: safe for use by multiple goroutines via internal locking.
 
 **Important**: Like `FixedBlockMap` serialization, `PagedArray` copies raw element memory. `T` must be a fixed-size value type with no pointers, slices, maps, or other reference types. Files are not portable across architectures with differing endianness or type layout.
 
@@ -551,43 +534,44 @@ import (
 )
 
 func main() {
-    data := make([]uint32, 1_000_000)
-    for i := range data {
-        data[i] = uint32(i)
-    }
-
-    // Write the data to a paged file using 64 KiB pages.
-    if err := collections.CreatePagedArrayFile("data.paged", data, 64*1024); err != nil {
-        panic(err)
-    }
-
-    // Open it with a 16 MiB resident-memory budget.
-    pa, err := collections.OpenPagedArray[uint32]("data.paged", 16*1024*1024)
+    // Open a paged array in a directory, holding at most 1000 pages in memory.
+    pa, err := collections.NewPagedArray[uint32]("./data_dir", 1000)
     if err != nil {
         panic(err)
     }
     defer pa.Close()
 
-    _ = pa.At(500_000)                   // fault in the relevant page, copy out the value
-    row := pa.Slice(1000, 1100, nil)     // copy a contiguous run into a fresh slice
-    _ = row
+    // Write data to the paged array
+    for i := 0; i < 1_000_000; i++ {
+        if err := pa.Set(i, uint32(i)); err != nil {
+            panic(err)
+        }
+    }
+
+    // Read data back
+    val, err := pa.At(500_000) // faults in the relevant page, copies out the value
+    if err != nil {
+        panic(err)
+    }
+    _ = val
 }
 ```
 
 #### API Reference
 
-- `CreatePagedArrayFile[T](path string, data []T, pageSizeBytes int) error` — writes `data` to a new paged file. A non-positive `pageSizeBytes` uses `DefaultPageSize` (64 KiB).
-- `OpenPagedArray[T](path string, budgetBytes int) (*PagedArray[T], error)` — opens a file read-only; validates that `T`'s size matches the file.
-- `(*PagedArray[T]).Len() int`
-- `(*PagedArray[T]).At(i int) T` — copies out the element (safe to retain after eviction).
-- `(*PagedArray[T]).Slice(start, end int, dst []T) []T` — copies a range into `dst` (grown as needed), handling page-spanning runs.
-- `(*PagedArray[T]).Close() error` — flushes any dirty pages and closes the file.
+- `NewPagedArray[T any](directory string, maxLoadedPages int) (*PagedArray[T], error)` — creates or opens a paged array in the specified directory.
+- `(*PagedArray[T]).Len() int` — returns the length of the array, tracked automatically during initialization and `Set` operations.
+- `(*PagedArray[T]).At(index int) (T, error)` — reads the element at the given index.
+- `(*PagedArray[T]).Set(index int, value T) error` — writes the element at the given index.
+- `(*PagedArray[T]).Slice(start, end int, dest []T) ([]T, error)` — copies a contiguous range into `dest`.
+- `(*PagedArray[T]).Flush() error` — explicitly flushes any dirty pages and metadata to disk.
+- `(*PagedArray[T]).Close() error` — flushes any dirty pages/metadata and closes the open files.
 
 #### Performance Characteristics
 
-- **Resident memory**: hard-capped at the configured budget; never grows with data size.
-- **Cache hit**: O(1) lookup plus a value copy.
-- **Cache miss**: one `ReadAt` of a single page, with at most one eviction (and a flush if the evicted page is dirty).
+- **Resident memory**: hard-capped at the configured page limit; never grows with data size.
+- **Cache hit**: fast lookup with a lock and value copy.
+- **Cache miss**: disk read of a single page, with at most one eviction (and a flush if the evicted page is dirty).
 
 ## StringArena
 
