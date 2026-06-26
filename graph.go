@@ -158,6 +158,12 @@ func (g *MutableDirectedGraph[OffsetType, EdgeType]) Neighbors(denseId DenseId) 
 	defer g.lock.RUnlock()
 
 	tombstones, hasDeletes := g.removedEdges[denseId]
+	_, hasAdded := g.addedEdges[denseId]
+
+	// early out if no modifications have been done to this node
+	if !hasDeletes && !hasAdded {
+		return baseNeighbors, baseLabels
+	}
 
 	if hasDeletes {
 		for i := 0; i < len(baseNeighbors); i++ {
@@ -179,8 +185,7 @@ func (g *MutableDirectedGraph[OffsetType, EdgeType]) Neighbors(denseId DenseId) 
 		}
 	}
 
-	added, hasAdded := g.addedEdges[denseId]
-	if hasAdded {
+	if added, ok := g.addedEdges[denseId]; ok {
 		neighbors = append(neighbors, added...)
 
 		if g.DirectedGraph.labels != nil {
