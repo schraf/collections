@@ -2,7 +2,10 @@ module github.com/schraf/collections
 
 go 1.26.1
 
-require github.com/cespare/xxhash/v2 v2.3.0
+require (
+	github.com/cespare/xxhash/v2 v2.3.0
+	github.com/hashicorp/golang-lru/v2 v2.0.7
+)
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
